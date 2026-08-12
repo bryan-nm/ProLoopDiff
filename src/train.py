@@ -10,6 +10,7 @@ Launch (Aurora): via train.pbs (mpiexec, one rank per tile). Local smoke:
 from __future__ import annotations
 import os
 import math
+import time
 import argparse
 import torch
 
@@ -61,6 +62,23 @@ def find_latest_ckpt(ckpt_dir):
         return None
     full = os.path.join(ckpt_dir, open(p).read().strip())
     return full if os.path.exists(full) else None
+
+
+def _device_sync(dev):
+    # XPU/CUDA ops are async; sync before timing so tok/s reflects real compute, not enqueue time.
+    if dev.type == "xpu":
+        torch.xpu.synchronize()
+    elif dev.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def _peak_mem_gb(dev):
+    # Cumulative high-water mark of allocated HBM -> the number that matters for OOM headroom.
+    if dev.type == "xpu":
+        return torch.xpu.max_memory_allocated() / 1e9
+    if dev.type == "cuda":
+        return torch.cuda.max_memory_allocated() / 1e9
+    return 0.0
 
 
 def main():
@@ -119,12 +137,15 @@ def main():
         print(f"[train] swissprot={len(sp_rows)} unannotated={len(unannot)} mixed={len(ds)} "
               f"text={'cache' if has_cache else type(embedder).__name__} batches/epoch/rank={len(sampler)}", flush=True)
 
-    # --- optimizer ---
+    # --- optimizer + ipex; build the LR scheduler AFTER ipex.optimize so it binds to the optimizer
+    #     that actually steps (removes the "optimizer.step() overridden after scheduler init" warning
+    #     and any doubt about whether the schedule reaches the stepping optimizer) ---
     opt = torch.optim.AdamW(model.parameters(), lr=ocfg.lr, weight_decay=ocfg.weight_decay, betas=(0.9, 0.98))
+    if ipex is not None and dev.type == "xpu":
+        model, opt = ipex.optimize(model, optimizer=opt, dtype=torch.bfloat16)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, ocfg.warmup_steps, ocfg.total_steps))
 
-    # --- resume (load into the plain model/opt BEFORE ipex.optimize; our model is conv-free so ipex
-    #     does not repack params and state_dict keys are stable) ---
+    # --- resume (conv-free model -> ipex keeps state_dict keys stable; opt-state load best-effort) ---
     start_step = 0
     ckpt_path = None if args.fresh else find_latest_ckpt(CKPT_DIR)
     if ckpt_path:
@@ -132,27 +153,26 @@ def main():
         model.load_state_dict(ck["model"])
         try:
             opt.load_state_dict(ck["opt"])
-        except Exception as ex:                                    # tolerate optimizer-state shape drift
+        except Exception as ex:
             if env.is_main:
                 print(f"[ckpt] optimizer state not restored ({ex}); re-warming moments.", flush=True)
         sched.load_state_dict(ck["sched"])
         start_step = int(ck["step"]) + 1
-        broadcast_parameters(model)                                # all ranks read the same file; belt-and-suspenders
+        broadcast_parameters(model)
         if env.is_main:
             print(f"[ckpt] resumed from {ckpt_path}: continuing at step {start_step}", flush=True)
-
-    if ipex is not None and dev.type == "xpu":
-        model, opt = ipex.optimize(model, optimizer=opt, dtype=torch.bfloat16)
 
     total = args.max_steps or (60 if args.smoke else ocfg.total_steps)
     log_every = 10 if args.smoke else ocfg.log_every
     use_amp = dev.type in ("xpu", "cuda")
     step = start_step
+    tok_win, steps_win, t_win = 0, 0, time.perf_counter()      # throughput window (reset each log)
     model.train()
     while step < total:
         sampler.set_epoch(step)
         for batch in loader:
             batch = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            n_tok = batch["tokens"].numel()                    # canvas tokens processed this step (B*L)
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
                 loss, m = training_step(model, batch, p_uncond=ocfg.p_uncond, lam_filip=ocfg.lam_filip,
@@ -162,9 +182,17 @@ def main():
             average_gradients(model)
             opt.step()
             sched.step()
+            tok_win += n_tok
+            steps_win += 1
             if env.is_main and step % log_every == 0:
+                _device_sync(dev)                              # finish queued work before reading the clock
+                dt = max(time.perf_counter() - t_win, 1e-9)
+                rate = f"{tok_win / dt / 1e3:.0f}k tok/s | {dt / steps_win:.2f}s/step"
+                peak = _peak_mem_gb(dev)
+                mem = f" | peak {peak:.1f}GB" if peak else ""
                 print(f"step {step:>7} | loss {m['total']:.3f} | oadm {m['oadm']:.3f} | filip {m['filip']:.3f} "
-                      f"| cond {m['n_cond']}/{m['n_labelled']} | lr {sched.get_last_lr()[0]:.2e}", flush=True)
+                      f"| cond {m['n_cond']}/{m['n_labelled']} | lr {sched.get_last_lr()[0]:.2e} | {rate}{mem}", flush=True)
+                tok_win, steps_win, t_win = 0, 0, time.perf_counter()
             if step > 0 and step % ocfg.ckpt_every == 0:
                 save_checkpoint(model, opt, sched, step, CKPT_DIR, env)
             step += 1

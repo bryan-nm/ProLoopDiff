@@ -50,7 +50,10 @@ class DataCfg:
 @dataclass
 class OptCfg:
     global_batch_tokens: int = 32768     # target residues/step summed over the batch (bucketed)
-    micro_batch: int = 16                # sequences per rank per step (bucketing sets width)
+    # sequences per rank per step. With mixed batches (~p_swissprot labelled), FiLIP negatives ≈
+    # micro_batch * p_swissprot, so 64 gives ~16 labelled/batch (parity with the old homogeneous ~14)
+    # and better tile utilization. Watch HBM on the next debug run; fall back to 32 if it OOMs.
+    micro_batch: int = 64
     lr: float = 3e-4
     warmup_steps: int = 2000
     total_steps: int = 200_000

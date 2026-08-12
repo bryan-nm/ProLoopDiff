@@ -243,7 +243,13 @@ class BucketedBatchSampler(torch.utils.data.Sampler):
     def __init__(self, lengths, micro_batch, rank=0, world=1, shuffle=True, seed=0):
         self.mb, self.rank, self.world = micro_batch, rank, world
         self.shuffle, self.seed, self.epoch = shuffle, seed, 0
-        self.order = np.argsort(np.asarray(lengths), kind="stable").astype(np.int32)   # indices < 2^31
+        lengths = np.asarray(lengths)
+        # Sort by length, breaking ties RANDOMLY (seeded identically on every rank). A stable sort would
+        # keep the concatenated SwissProt block ahead of the corpus block within each length, making
+        # batches all-labelled or all-unlabelled; the random tiebreak interleaves the two sources so
+        # each batch carries ~p_swissprot labelled rows. Same-length only, so padding stays tight.
+        tiebreak = np.random.default_rng(seed).integers(0, 1 << 20, len(lengths), dtype=np.int64)
+        self.order = np.lexsort((tiebreak, lengths)).astype(np.int32)   # primary key = lengths, indices < 2^31
         self.n_batches = len(self.order) // self.mb
 
     def set_epoch(self, e):
