@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+
+# Runs / artifacts (paths owned by config.py; kept out of the repo)
+checkpoints/
+runs/
+*.pt
+*.ckpt
+*.safetensors
+
+# Precomputed / preprocessed data
+*.bin
+*.idx
+*_cache/
+*_shards/
+
+# Local env overrides
+.env

@@ -1,0 +1,20 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N protgen_train
+#PBS -l walltime=00:30:00
+#PBS -l select=2
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fsx
+#PBS -q debug
+#PBS -j oe
+
+# Recurrent-OADM protein generator training. Model/dataset paths are owned by config.py.
+# Submit with qsub from the repo root. The cd MUST precede the source (see pbs_common.sh).
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+job_banner "protein-gen training (src.train)"
+
+"${MPI_LAUNCH[@]}" python -m src.train --device xpu
+
+echo "[job] exit $?"

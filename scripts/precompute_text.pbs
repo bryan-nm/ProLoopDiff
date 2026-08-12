@@ -1,0 +1,20 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N protgen_precompute
+#PBS -l walltime=00:30:00
+#PBS -l select=2
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fsx
+#PBS -q debug
+#PBS -j oe
+
+# Precompute BiomedBERT token embeddings for SwissProt captions -> config.TEXT_CACHE.
+# All ranks encode a contiguous slice; rank 0 merges. Run ONCE before training.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+job_banner "text precompute (src.precompute_text)"
+
+"${MPI_LAUNCH[@]}" python -m src.precompute_text --device xpu --batch-size 64
+
+echo "[job] exit $?"
