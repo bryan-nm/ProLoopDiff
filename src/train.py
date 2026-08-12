@@ -34,10 +34,41 @@ def lr_lambda(step, warmup, total):
     return 0.5 * (1 + math.cos(math.pi * min(p, 1.0)))
 
 
+# --- checkpointing (rank 0 writes; atomic via tmp+rename; latest.txt is the resume pointer) ---
+def _atomic_save(obj, path):
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def save_checkpoint(model, opt, sched, step, ckpt_dir, env):
+    if not env.is_main:
+        return
+    os.makedirs(ckpt_dir, exist_ok=True)
+    path = os.path.join(ckpt_dir, f"ckpt_{step:08d}.pt")
+    _atomic_save({"model": model.state_dict(), "opt": opt.state_dict(),
+                  "sched": sched.state_dict(), "step": step}, path)
+    tmp = os.path.join(ckpt_dir, "latest.txt.tmp")     # update the pointer only after the ckpt is fully written
+    with open(tmp, "w") as f:
+        f.write(os.path.basename(path))
+    os.replace(tmp, os.path.join(ckpt_dir, "latest.txt"))
+    print(f"[ckpt] saved {path}", flush=True)
+
+
+def find_latest_ckpt(ckpt_dir):
+    p = os.path.join(ckpt_dir, "latest.txt")
+    if not os.path.exists(p):
+        return None
+    full = os.path.join(ckpt_dir, open(p).read().strip())
+    return full if os.path.exists(full) else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default=CFG.device)
     ap.add_argument("--smoke", action="store_true", help="tiny CPU run: few CSV rows, dummy text, a few steps")
+    ap.add_argument("--fresh", action="store_true", help="ignore any existing checkpoint and start from step 0")
+    ap.add_argument("--max-steps", type=int, default=None, help="override total_steps (e.g. debug-queue validation)")
     args = ap.parse_args()
 
     env = init_distributed(args.device)
@@ -88,16 +119,35 @@ def main():
         print(f"[train] swissprot={len(sp_rows)} unannotated={len(unannot)} mixed={len(ds)} "
               f"text={'cache' if has_cache else type(embedder).__name__} batches/epoch/rank={len(sampler)}", flush=True)
 
-    # --- optimizer / ipex ---
+    # --- optimizer ---
     opt = torch.optim.AdamW(model.parameters(), lr=ocfg.lr, weight_decay=ocfg.weight_decay, betas=(0.9, 0.98))
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, ocfg.warmup_steps, ocfg.total_steps))
+
+    # --- resume (load into the plain model/opt BEFORE ipex.optimize; our model is conv-free so ipex
+    #     does not repack params and state_dict keys are stable) ---
+    start_step = 0
+    ckpt_path = None if args.fresh else find_latest_ckpt(CKPT_DIR)
+    if ckpt_path:
+        ck = torch.load(ckpt_path, map_location=dev)
+        model.load_state_dict(ck["model"])
+        try:
+            opt.load_state_dict(ck["opt"])
+        except Exception as ex:                                    # tolerate optimizer-state shape drift
+            if env.is_main:
+                print(f"[ckpt] optimizer state not restored ({ex}); re-warming moments.", flush=True)
+        sched.load_state_dict(ck["sched"])
+        start_step = int(ck["step"]) + 1
+        broadcast_parameters(model)                                # all ranks read the same file; belt-and-suspenders
+        if env.is_main:
+            print(f"[ckpt] resumed from {ckpt_path}: continuing at step {start_step}", flush=True)
+
     if ipex is not None and dev.type == "xpu":
         model, opt = ipex.optimize(model, optimizer=opt, dtype=torch.bfloat16)
 
-    total = 60 if args.smoke else ocfg.total_steps
+    total = args.max_steps or (60 if args.smoke else ocfg.total_steps)
     log_every = 10 if args.smoke else ocfg.log_every
     use_amp = dev.type in ("xpu", "cuda")
-    step = 0
+    step = start_step
     model.train()
     while step < total:
         sampler.set_epoch(step)
@@ -115,12 +165,12 @@ def main():
             if env.is_main and step % log_every == 0:
                 print(f"step {step:>7} | loss {m['total']:.3f} | oadm {m['oadm']:.3f} | filip {m['filip']:.3f} "
                       f"| cond {m['n_cond']}/{m['n_labelled']} | lr {sched.get_last_lr()[0]:.2e}", flush=True)
-            if env.is_main and step > 0 and step % ocfg.ckpt_every == 0:
-                os.makedirs(CKPT_DIR, exist_ok=True)
-                torch.save({"model": model.state_dict(), "step": step}, os.path.join(CKPT_DIR, f"ckpt_{step}.pt"))
+            if step > 0 and step % ocfg.ckpt_every == 0:
+                save_checkpoint(model, opt, sched, step, CKPT_DIR, env)
             step += 1
             if step >= total:
                 break
+    save_checkpoint(model, opt, sched, step - 1, CKPT_DIR, env)     # final checkpoint
     if env.is_main:
         print(f"[train] done at step {step}", flush=True)
     barrier()
