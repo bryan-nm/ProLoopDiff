@@ -1,0 +1,27 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N proloop_preprocess
+#PBS -l walltime=06:00:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fsx
+#PBS -q capacity
+#PBS -j oe
+
+# Tokenise the UniRef90 FASTA -> packed shards. SINGLE node, CPU only (no GPU, no mpiexec):
+# a single Python process streams the FASTA. Paths come from config.py.
+#   - length filter 30-500 (match the SwissProt build)
+#   - --exclude-csv drops sequences that exactly match a SwissProt entry
+#   - NO --dedup: UniRef90 is already dereplicated at 90% identity, and --dedup's hash set is the
+#     memory-heavy part at ~150M sequences. Add it back only if you feed a non-UniRef corpus.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+FASTA=$(python -c "from config import UNIREF90_FASTA; print(UNIREF90_FASTA)")
+OUT=$(python -c "from config import UNANNOTATED_SHARDS; print(UNANNOTATED_SHARDS)")
+EXCL=$(python -c "from config import SWISSPROT_CSV; print(SWISSPROT_CSV)")
+job_banner "UniRef90 preprocess (src.preprocess_fasta)" FASTA OUT EXCL
+
+python -m src.preprocess_fasta "$FASTA" "$OUT" --min 30 --max 500 --exclude-csv "$EXCL"
+
+echo "[job] exit $?"

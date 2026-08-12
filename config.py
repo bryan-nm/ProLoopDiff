@@ -26,6 +26,7 @@ RUNS_DIR = os.environ.get("PROTGEN_RUNS_DIR", "/flare/NLDesignProtein/bryan/Diff
 SWISSPROT_CSV = os.environ.get("PROTGEN_SWISSPROT_CSV", f"{DATASETS_DIR}/fully_annotated_swiss_prot_080326.csv")
 # Unannotated corpus = UniRef90, filtered to SwissProt's size constraints (30-500 aa) with exact
 # SwissProt duplicates removed (see preprocess_fasta.py --exclude-csv). Packed *.bin + *.idx shards.
+UNIREF90_FASTA = os.environ.get("PROTGEN_UNIREF90_FASTA", f"{DATASETS_DIR}/uniref90.fasta.gz")  # preprocess input
 UNANNOTATED_SHARDS = os.environ.get("PROTGEN_UNANNOTATED_SHARDS", f"{DATASETS_DIR}/uniref90_shards")
 TEXT_ENCODER = os.environ.get("PROTGEN_TEXT_ENCODER", f"{MODELS_DIR}/BioLinkBERT-base")       # PubMedBERT-full
 BLOSUM_MAT = os.environ.get("PROTGEN_BLOSUM", f"{MODELS_DIR}/blosum62-special-MSA.mat")

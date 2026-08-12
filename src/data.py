@@ -14,6 +14,7 @@ import csv
 import random
 from dataclasses import dataclass
 from typing import Optional, List
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -23,22 +24,29 @@ from .blosum import AA                                  # canonical 20-AA alphab
 _RARE = {"B": "D", "Z": "E", "J": "L", "U": "C", "O": "K", "X": "A"}
 _AA_ID = {c: i for i, c in enumerate(AA)}
 
+# 256-entry byte->id table (255 = unmappable). Lets encode() run as a single C-level lookup instead of
+# a per-char Python loop -- the difference that matters when tokenising ~150M UniRef90 sequences.
+_INVALID = 255
+_ENCODE_TABLE = np.full(256, _INVALID, dtype=np.uint8)
+for _c, _i in _AA_ID.items():
+    _ENCODE_TABLE[ord(_c)] = _i
+for _r, _std in _RARE.items():
+    _ENCODE_TABLE[ord(_r)] = _AA_ID[_std]
+
 
 class ProteinTokenizer:
     def __init__(self, cfg):
         self.eos, self.pad, self.mask = cfg.eos_token_id, cfg.pad_token_id, cfg.mask_token_id
 
     def encode(self, seq: str) -> Optional[List[int]]:
-        """Amino-acid string -> [ids..., EOS]. Returns None if the sequence has unmappable chars."""
-        ids = []
-        for c in seq.strip().upper():
-            c = _RARE.get(c, c)
-            j = _AA_ID.get(c)
-            if j is None:
-                return None
-            ids.append(j)
-        ids.append(self.eos)
-        return ids
+        """Amino-acid string -> [ids..., EOS]. Returns None if the sequence has any unmappable char."""
+        b = seq.strip().upper().encode("ascii", "replace")   # non-ascii -> '?' (63) -> _INVALID below
+        if not b:
+            return None
+        mapped = _ENCODE_TABLE[np.frombuffer(b, dtype=np.uint8)]
+        if (mapped == _INVALID).any():
+            return None
+        return mapped.tolist() + [self.eos]
 
 
 # ---------------------------------------------------------------------------
