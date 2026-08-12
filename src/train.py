@@ -109,7 +109,7 @@ def main():
             else HFTextEmbedder(TEXT_ENCODER, dcfg.max_text_tokens, device="cpu")
 
     mb = 4 if args.smoke else ocfg.micro_batch
-    sampler = BucketedBatchSampler([len(ds[i]["ids"]) for i in range(len(ds))], mb,
+    sampler = BucketedBatchSampler(ds.lengths, mb,               # ds.lengths is a precomputed numpy array
                                    rank=env.rank, world=env.world_size, seed=ocfg.seed)
     # A live HF encoder holds a torch model that can't be forked to workers; the cache reader is fork-safe.
     nw = 0 if (args.smoke or isinstance(embedder, HFTextEmbedder)) else dcfg.num_workers

@@ -162,81 +162,102 @@ def load_swissprot(path, tokenizer, limit=None):
 
 class ProteinShards:
     """Reader for pre-tokenised unannotated-corpus shards (UniRef90): uint8 .bin of ids 0..19 + .idx
-    of int64 offsets (see preprocess_fasta.py). Empty/absent -> len 0 (pure-SwissProt runs still work)."""
+    of int64 offsets (see preprocess_fasta.py). Empty/absent -> len 0 (pure-SwissProt runs still work).
+
+    Scale note: at ~100M+ sequences we must NOT build a per-sequence Python index. We keep only the
+    per-shard offset arrays + a cumulative count, and locate item i by searchsorted (O(log #shards))."""
     def __init__(self, shard_dir, eos_id):
         import glob
         self.eos_id = eos_id
-        self.bins = sorted(glob.glob(os.path.join(shard_dir, "*.bin"))) if shard_dir and os.path.isdir(shard_dir) else []
+        bins = sorted(glob.glob(os.path.join(shard_dir, "*.bin"))) if shard_dir and os.path.isdir(shard_dir) else []
         self.offsets, self.data = [], []
-        for b in self.bins:
-            import numpy as np
-            idx = np.fromfile(b[:-4] + ".idx", dtype="int64")
+        for b in bins:
+            self.offsets.append(np.fromfile(b[:-4] + ".idx", dtype="int64"))
             self.data.append(np.memmap(b, dtype="uint8", mode="r"))
-            self.offsets.append(idx)
-        self.index = [(s, k) for s, off in enumerate(self.offsets) for k in range(len(off) - 1)]
+        counts = [len(off) - 1 for off in self.offsets]
+        self.cum = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64) if counts else np.array([0], np.int64)
+        self._n = int(self.cum[-1])
 
     def __len__(self):
-        return len(self.index)
+        return self._n
 
-    def get_len(self, i):                                   # O(1) from the offset index (no data read)
-        s, k = self.index[i]
+    def _locate(self, i):
+        s = int(np.searchsorted(self.cum, i, side="right") - 1)
+        return s, i - int(self.cum[s])
+
+    def get_len(self, i):
+        s, k = self._locate(i)
         return int(self.offsets[s][k + 1] - self.offsets[s][k]) + 1   # +1 for EOS
 
     def get(self, i):
-        s, k = self.index[i]
-        a, b = self.offsets[s][k], self.offsets[s][k + 1]
-        return [int(x) for x in self.data[s][a:b]] + [self.eos_id]    # append EOS (shards store residues only)
+        s, k = self._locate(i)
+        a, b = int(self.offsets[s][k]), int(self.offsets[s][k + 1])
+        return self.data[s][a:b].tolist() + [self.eos_id]            # append EOS (shards store residues only)
+
+    def lengths_array(self) -> np.ndarray:
+        """All sequence lengths (+EOS) as one int32 array, vectorised from the offset arrays."""
+        if not self.offsets:
+            return np.zeros(0, dtype=np.int32)
+        return np.concatenate([np.diff(off).astype(np.int32) + 1 for off in self.offsets])
 
 
 class MixedProteinDataset(Dataset):
     """Unified index over labelled SwissProt (oversampled to hit p_swissprot) + the unlabelled corpus.
-    SwissProt rows are (accession, ids, caption); the SwissProt list index doubles as the text-cache
-    row index (text_idx), carried on each labelled sample."""
+    No per-item Python list: sources are resolved arithmetically, and lengths are one numpy array.
+    SwissProt list index doubles as the text-cache row index (text_idx), carried on each labelled sample."""
     def __init__(self, swissprot_rows, unannotated: Optional["ProteinShards"], p_swissprot: float):
         self.sp = swissprot_rows
         self.un = unannotated
+        self._nsp = len(self.sp)
         n_un = len(unannotated) if unannotated else 0
-        if n_un == 0 or not self.sp:
-            self.items = [("sp", i) for i in range(len(self.sp))] or [("un", i) for i in range(n_un)]
+        self.n_un = n_un
+        if n_un == 0 or self._nsp == 0:
+            self.n_sp_target = self._nsp
         else:
-            n_sp_target = int(round(p_swissprot / (1 - p_swissprot) * n_un))
-            self.items = [("sp", i % len(self.sp)) for i in range(n_sp_target)] + [("un", i) for i in range(n_un)]
-            random.Random(0).shuffle(self.items)
-        self.lengths = [len(self.sp[i][1]) if s == "sp" else self.un.get_len(i) for (s, i) in self.items]
+            self.n_sp_target = int(round(p_swissprot / (1 - p_swissprot) * n_un))  # oversample SwissProt
+
+        sp_len = np.array([len(r[1]) for r in self.sp], dtype=np.int32) if self._nsp else np.zeros(0, np.int32)
+        sp_part = sp_len[np.arange(self.n_sp_target) % self._nsp] if (self.n_sp_target and self._nsp) \
+            else np.zeros(0, np.int32)
+        un_part = unannotated.lengths_array() if (unannotated and n_un) else np.zeros(0, np.int32)
+        self.lengths = np.concatenate([sp_part, un_part])      # (n_sp_target + n_un,) int32
 
     def __len__(self):
-        return len(self.items)
+        return int(self.n_sp_target + self.n_un)
 
     def __getitem__(self, k):
-        s, i = self.items[k]
-        if s == "sp":
+        if k < self.n_sp_target:                               # SwissProt block (oversampled, wraps)
+            i = k % self._nsp
             _acc, ids, caption = self.sp[i]
             return {"ids": ids, "caption": caption, "labelled": True, "text_idx": i}
-        return {"ids": self.un.get(i), "caption": None, "labelled": False, "text_idx": -1}
+        j = k - self.n_sp_target                               # unannotated block
+        return {"ids": self.un.get(j), "caption": None, "labelled": False, "text_idx": -1}
 
 
 # ---------------------------------------------------------------------------
 # Length bucketing + collate
 # ---------------------------------------------------------------------------
 class BucketedBatchSampler(torch.utils.data.Sampler):
-    """Yield batches of similar-length indices, sharded across ranks. drop_last so per-rank step count matches."""
+    """Yield batches of similar-length indices, sharded across ranks. drop_last so per-rank step count
+    matches. The global argsort is computed ONCE (numpy); each epoch only permutes batch order."""
     def __init__(self, lengths, micro_batch, rank=0, world=1, shuffle=True, seed=0):
-        self.lengths, self.mb, self.rank, self.world = lengths, micro_batch, rank, world
+        self.mb, self.rank, self.world = micro_batch, rank, world
         self.shuffle, self.seed, self.epoch = shuffle, seed, 0
+        self.order = np.argsort(np.asarray(lengths), kind="stable").astype(np.int32)   # indices < 2^31
+        self.n_batches = len(self.order) // self.mb
 
     def set_epoch(self, e):
         self.epoch = e
 
     def __iter__(self):
-        order = sorted(range(len(self.lengths)), key=lambda i: self.lengths[i])
-        batches = [order[i:i + self.mb] for i in range(0, len(order), self.mb) if len(order[i:i + self.mb]) == self.mb]
-        if self.shuffle:
-            random.Random(self.seed + self.epoch).shuffle(batches)
-        for b in batches[self.rank::self.world]:            # each rank takes every world-th batch
-            yield b
+        perm = (np.random.default_rng(self.seed + self.epoch).permutation(self.n_batches)
+                if self.shuffle else np.arange(self.n_batches))
+        for b in perm[self.rank::self.world]:               # each rank takes every world-th batch
+            s = int(b) * self.mb
+            yield self.order[s:s + self.mb].tolist()
 
     def __len__(self):
-        return (len(self.lengths) // self.mb) // self.world
+        return self.n_batches // self.world
 
 
 def make_collate(embedder, cfg_model):
