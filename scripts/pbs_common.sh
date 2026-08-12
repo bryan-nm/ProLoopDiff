@@ -58,3 +58,31 @@ job_banner() {
     for v in "$@"; do printf '    %-24s = %s\n' "$v" "${!v}"; done
     echo "================================================================"
 }
+
+# ---------------------------------------------------------------------------
+# Slack notifications: START now (topology is known), FINISH via an EXIT trap.
+# Centralised here (mini-embed-filip splits START into each script; we keep both in one place),
+# so no job script repeats a slack line. Requires ~/bin/slack_notify.sh, which defines `slack "<msg>"`;
+# if it's absent (local / non-Aurora), `slack` is a no-op so nothing breaks.
+#
+# The FINISH trap reads $? at exit, so each job script MUST end with `exit $rc` (see below) rather
+# than a status-resetting command like a trailing `echo`, or the reported code is always 0.
+# ---------------------------------------------------------------------------
+if [ -f ~/bin/slack_notify.sh ]; then
+    source ~/bin/slack_notify.sh
+else
+    slack() { :; }
+fi
+
+_slack_finish() {
+    local rc=$1
+    if [ "$rc" -eq 0 ]; then
+        slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME}"
+    else
+        slack ":x: FAILED (exit ${rc}) ${PBS_JOBID} ${PBS_JOBNAME}"
+    fi
+    echo "[job] finished $(date '+%Y-%m-%dT%H:%M:%S%z') exit=${rc}"
+}
+trap '_slack_finish $?' EXIT
+
+slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"

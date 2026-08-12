@@ -16,5 +16,4 @@ source ./scripts/pbs_common.sh
 job_banner "text precompute (src.precompute_text)"
 
 "${MPI_LAUNCH[@]}" python -m src.precompute_text --device xpu --batch-size 64
-
-echo "[job] exit $?"
+rc=$?; echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap in pbs_common reports the true code

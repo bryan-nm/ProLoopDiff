@@ -23,5 +23,4 @@ EXCL=$(python -c "from config import SWISSPROT_CSV; print(SWISSPROT_CSV)")
 job_banner "UniRef90 preprocess (src.preprocess_fasta)" FASTA OUT EXCL
 
 python -m src.preprocess_fasta "$FASTA" "$OUT" --min 30 --max 500 --exclude-csv "$EXCL"
-
-echo "[job] exit $?"
+rc=$?; echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap in pbs_common reports the true code

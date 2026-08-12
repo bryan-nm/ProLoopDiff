@@ -16,5 +16,4 @@ source ./scripts/pbs_common.sh
 job_banner "protein-gen training (src.train)"
 
 "${MPI_LAUNCH[@]}" python -m src.train --device xpu
-
-echo "[job] exit $?"
+rc=$?; echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap in pbs_common reports the true code
