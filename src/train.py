@@ -42,7 +42,7 @@ def _atomic_save(obj, path):
     os.replace(tmp, path)
 
 
-def save_checkpoint(model, opt, sched, step, ckpt_dir, env):
+def save_checkpoint(model, opt, sched, step, ckpt_dir, env, keep_last=3):
     if not env.is_main:
         return
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -54,6 +54,14 @@ def save_checkpoint(model, opt, sched, step, ckpt_dir, env):
         f.write(os.path.basename(path))
     os.replace(tmp, os.path.join(ckpt_dir, "latest.txt"))
     print(f"[ckpt] saved {path}", flush=True)
+    if keep_last:                                      # rotate: keep only the newest `keep_last` (model+opt is big)
+        import glob
+        ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "ckpt_*.pt")))
+        for old in ckpts[:-keep_last]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
 
 
 def find_latest_ckpt(ckpt_dir):

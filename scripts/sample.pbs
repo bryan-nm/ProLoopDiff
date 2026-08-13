@@ -1,0 +1,21 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N proloop_sample
+#PBS -l walltime=00:20:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fsx
+#PBS -q debug
+#PBS -j oe
+
+# Unconditional sampling from the latest checkpoint. Single process on one tile (no mpiexec needed).
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+job_banner "unconditional sampling (src.sample)"
+
+N=${N:-64}
+OUT=${OUT:-samples.fasta}
+python -m src.sample --device xpu --n "${N}" --out "${OUT}"
+
+rc=$?; echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap in pbs_common reports the true code
