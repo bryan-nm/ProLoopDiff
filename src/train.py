@@ -87,6 +87,8 @@ def main():
     ap.add_argument("--smoke", action="store_true", help="tiny CPU run: few CSV rows, dummy text, a few steps")
     ap.add_argument("--fresh", action="store_true", help="ignore any existing checkpoint and start from step 0")
     ap.add_argument("--max-steps", type=int, default=None, help="override total_steps (e.g. debug-queue validation)")
+    ap.add_argument("--no-ipex", action="store_true", help="skip ipex.optimize (eager XPU; robust to dynamic shapes)")
+    ap.add_argument("--no-filip", action="store_true", help="disable the FiLIP auxiliary loss (isolation)")
     args = ap.parse_args()
 
     env = init_distributed(args.device)
@@ -141,8 +143,11 @@ def main():
     #     that actually steps (removes the "optimizer.step() overridden after scheduler init" warning
     #     and any doubt about whether the schedule reaches the stepping optimizer) ---
     opt = torch.optim.AdamW(model.parameters(), lr=ocfg.lr, weight_decay=ocfg.weight_decay, betas=(0.9, 0.98))
-    if ipex is not None and dev.type == "xpu":
+    use_ipex = ocfg.use_ipex and not args.no_ipex
+    if ipex is not None and dev.type == "xpu" and use_ipex:
         model, opt = ipex.optimize(model, optimizer=opt, dtype=torch.bfloat16)
+    elif env.is_main:
+        print(f"[train] ipex.optimize {'ON' if use_ipex else 'OFF (eager XPU)'}", flush=True)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, ocfg.warmup_steps, ocfg.total_steps))
 
     # --- resume (conv-free model -> ipex keeps state_dict keys stable; opt-state load best-effort) ---
@@ -175,7 +180,8 @@ def main():
             n_tok = batch["tokens"].numel()                    # canvas tokens processed this step (B*L)
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
-                loss, m = training_step(model, batch, p_uncond=ocfg.p_uncond, lam_filip=ocfg.lam_filip,
+                loss, m = training_step(model, batch, p_uncond=ocfg.p_uncond,
+                                        lam_filip=0.0 if args.no_filip else ocfg.lam_filip,
                                         beta=ocfg.beta, sub_probs=sub_probs, beta_schedule=ocfg.beta_schedule,
                                         filip_max_rows=ocfg.filip_max_rows)
             loss.backward()
