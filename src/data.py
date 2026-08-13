@@ -266,45 +266,87 @@ class BucketedBatchSampler(torch.utils.data.Sampler):
         return self.n_batches // self.world
 
 
-class FixedCompositionSampler(torch.utils.data.Sampler):
-    """Each batch = a FIXED n_lab labelled + n_unlab unlabelled rows, arranged [labelled..., unlabelled...],
-    so B_lab and the `labelled` mask pattern are CONSTANT every step (static shapes for XPU / FiLIP).
-    Labelled dataset indices are [0, n_lab_total); unlabelled are [sp_offset, sp_offset + n_un_total)."""
-    def __init__(self, n_lab_total, n_un_total, sp_offset, n_lab, n_unlab, rank=0, world=1, seed=0):
-        self.n_lab_total, self.n_un_total, self.sp_offset = n_lab_total, n_un_total, sp_offset
-        self.n_lab, self.n_unlab = n_lab, n_unlab
+class BucketedLengthSampler(torch.utils.data.Sampler):
+    """Length-bucketed, fixed-composition, token-budgeted batches. Each batch draws from ONE length
+    bucket and has a fixed (B, n_lab, n_unlab) for that bucket, arranged [labelled..., unlabelled...].
+    -> ONE static shape per bucket (a handful total) so XPU compiles each once instead of per length.
+
+    Per-bucket batch size B = token_budget // bucket_len, so short buckets pack more sequences at ~constant
+    memory (and the long bucket stays memory-safe). Labelled dataset indices are [0, n_sp_target);
+    unlabelled are [n_sp_target, n_total). `lengths` is the dataset's per-item length array."""
+    def __init__(self, lengths, n_sp_target, buckets, token_budget, p_swissprot,
+                 rank=0, world=1, seed=0, filip_min=2):
         self.rank, self.world, self.seed, self.epoch = rank, world, seed, 0
-        nb_lab = (n_lab_total // n_lab) if n_lab else 1 << 60
-        nb_un = (n_un_total // n_unlab) if n_unlab else 1 << 60
-        self.n_batches = int(min(nb_lab, nb_un))
+        buckets = list(buckets)
+        lengths = np.asarray(lengths)
+        n_total = len(lengths)
+        is_lab = np.arange(n_total) < n_sp_target
+        binid = np.clip(np.searchsorted(buckets, lengths, side="left"), 0, len(buckets) - 1)
+        self.plan = []
+        for bi, L in enumerate(buckets):
+            in_b = binid == bi
+            lab_pool = np.where(in_b & is_lab)[0].astype(np.int32)
+            un_pool = np.where(in_b & ~is_lab)[0].astype(np.int32)
+            if len(lab_pool) == 0 and len(un_pool) == 0:
+                continue
+            B = max(1, token_budget // L)
+            if len(lab_pool) == 0:
+                n_lab, n_unlab = 0, B
+            elif len(un_pool) == 0:
+                n_lab, n_unlab = B, 0
+            else:
+                n_lab = min(len(lab_pool), max(filip_min, round(B * p_swissprot)))
+                n_lab = min(n_lab, B - 1)                          # leave >=1 unlabelled slot
+                n_unlab = B - n_lab
+            nb_lab = (len(lab_pool) // n_lab) if n_lab else (1 << 60)
+            nb_un = (len(un_pool) // n_unlab) if n_unlab else (1 << 60)
+            n_batches = int(min(nb_lab, nb_un))
+            if n_batches:
+                self.plan.append(dict(L=L, B=B, n_lab=n_lab, n_unlab=n_unlab,
+                                      lab_pool=lab_pool, un_pool=un_pool, n_batches=n_batches))
+        self.total = sum(p["n_batches"] for p in self.plan)
 
     def set_epoch(self, e):
         self.epoch = e
 
+    def summary(self):
+        return "  ".join(f"L{p['L']}:B{p['B']}({p['n_lab']}L+{p['n_unlab']}U)x{p['n_batches']}" for p in self.plan)
+
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)          # same on every rank -> consistent batches
-        lab = rng.permutation(self.n_lab_total) if self.n_lab else None
-        un = rng.permutation(self.n_un_total) if self.n_unlab else None
-        for b in range(self.rank, self.n_batches, self.world):        # this rank's batches
+        perms = [(rng.permutation(len(p["lab_pool"])).astype(np.int32) if p["n_lab"] else None,
+                  rng.permutation(len(p["un_pool"])).astype(np.int32) if p["n_unlab"] else None)
+                 for p in self.plan]
+        bucket_ids = np.concatenate([np.full(p["n_batches"], bi, np.int32) for bi, p in enumerate(self.plan)])
+        batch_ids = np.concatenate([np.arange(p["n_batches"], dtype=np.int32) for p in self.plan])
+        sh = rng.permutation(len(bucket_ids))                        # interleave buckets, shuffle order
+        bucket_ids, batch_ids = bucket_ids[sh], batch_ids[sh]
+        for k in range(self.rank, len(bucket_ids), self.world):
+            bi, i = int(bucket_ids[k]), int(batch_ids[k])
+            p = self.plan[bi]
+            lp, up = perms[bi]
             batch = []
-            if self.n_lab:
-                batch += lab[b * self.n_lab:(b + 1) * self.n_lab].tolist()
-            if self.n_unlab:
-                batch += (self.sp_offset + un[b * self.n_unlab:(b + 1) * self.n_unlab]).tolist()
+            if p["n_lab"]:
+                batch += p["lab_pool"][lp[i * p["n_lab"]:(i + 1) * p["n_lab"]]].tolist()
+            if p["n_unlab"]:
+                batch += p["un_pool"][up[i * p["n_unlab"]:(i + 1) * p["n_unlab"]]].tolist()
             yield batch
 
     def __len__(self):
-        return self.n_batches // self.world
+        return self.total // self.world
 
 
-def make_collate(embedder, cfg_model, pad_protein_to, max_text_tokens):
+def make_collate(embedder, cfg_model, buckets, max_text_tokens):
     pad = cfg_model.pad_token_id
+    buckets = list(buckets)
 
     def collate(samples):
         B = len(samples)
-        tokens = torch.full((B, pad_protein_to), pad, dtype=torch.long)   # FIXED canvas length
+        maxlen = max(len(s["ids"]) for s in samples)
+        L = next((b for b in buckets if b >= maxlen), buckets[-1])       # this batch's bucket length
+        tokens = torch.full((B, L), pad, dtype=torch.long)
         for i, s in enumerate(samples):
-            ids = s["ids"][:pad_protein_to]
+            ids = s["ids"][:L]
             tokens[i, :len(ids)] = torch.tensor(ids)
         labelled = torch.tensor([s["labelled"] for s in samples])
         text_emb, text_keep = embedder.encode_samples(samples)           # (B, Tb, H), (B, Tb)
