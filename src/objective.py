@@ -121,7 +121,7 @@ def training_step(model: RecurrentOADM, batch: dict,
                   p_uncond: float = 0.1, lam_filip: float = 0.1,
                   beta: float = 1.0, sub_probs: Optional[torch.Tensor] = None,
                   beta_schedule: bool = False, filip_max_rows: Optional[int] = None,
-                  pad_loss_weight: float = 1.0):
+                  pad_loss_weight: float = 1.0, filip_cpu: bool = False):
     """
     batch:
       tokens:    (B, L) long
@@ -169,13 +169,19 @@ def training_step(model: RecurrentOADM, batch: dict,
         lab_idx = labelled.nonzero(as_tuple=True)[0]
         if filip_max_rows is not None and lab_idx.numel() > filip_max_rows:
             lab_idx = lab_idx[:filip_max_rows]
-        pk, tk = prot_keep.index_select(0, lab_idx), text_keep.index_select(0, lab_idx)
+        # Optionally run FiLIP entirely on CPU: its tensors are tiny (<=16xLxT), the round-trip is
+        # negligible, and it sidesteps the XPU FiLIP kernel that faults on some batches. autograd bridges
+        # devices, so gradients still flow back to the (XPU) PB features.
+        fdev = torch.device("cpu") if filip_cpu else lab_idx.device
+        li = lab_idx.to(fdev)
+        pk = prot_keep.to(fdev).index_select(0, li)
+        tk = text_keep.to(fdev).index_select(0, li)
         acc = 0.0
         for z_pre, zt_real in filip_pairs:                             # one pair per PB layer
-            acc = acc + filip_loss(z_pre.index_select(0, lab_idx), zt_real.index_select(0, lab_idx), pk, tk)
+            acc = acc + filip_loss(z_pre.to(fdev).index_select(0, li), zt_real.to(fdev).index_select(0, li), pk, tk)
         L_filip = acc / len(filip_pairs)
 
-    total = L_oadm + lam_filip * L_filip
+    total = L_oadm + lam_filip * L_filip.to(L_oadm.device)
     return total, {
         "total": float(total.detach()),
         "oadm": float(L_oadm.detach()),

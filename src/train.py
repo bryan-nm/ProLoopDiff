@@ -97,6 +97,7 @@ def main():
     ap.add_argument("--max-steps", type=int, default=None, help="override total_steps (e.g. debug-queue validation)")
     ap.add_argument("--no-ipex", action="store_true", help="skip ipex.optimize (eager XPU; robust to dynamic shapes)")
     ap.add_argument("--no-filip", action="store_true", help="disable the FiLIP auxiliary loss (isolation)")
+    ap.add_argument("--filip-cpu", action="store_true", help="compute FiLIP on CPU (sidesteps XPU FiLIP kernel fault)")
     args = ap.parse_args()
 
     env = init_distributed(args.device)
@@ -193,7 +194,8 @@ def main():
                 loss, m = training_step(model, batch, p_uncond=ocfg.p_uncond,
                                         lam_filip=0.0 if args.no_filip else ocfg.lam_filip,
                                         beta=ocfg.beta, sub_probs=sub_probs, beta_schedule=ocfg.beta_schedule,
-                                        filip_max_rows=ocfg.filip_max_rows, pad_loss_weight=ocfg.pad_loss_weight)
+                                        filip_max_rows=ocfg.filip_max_rows, pad_loss_weight=ocfg.pad_loss_weight,
+                                        filip_cpu=args.filip_cpu)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), ocfg.grad_clip)
             average_gradients(model)

@@ -76,7 +76,7 @@ class OptCfg:
     blosum_temp: float = 1.0             # BLOSUM substitution sharpness (inf -> uniform)
     # bookkeeping
     log_every: int = 50
-    ckpt_every: int = 5000
+    ckpt_every: int = 1000               # ~14min at scale; crashes are common on many tiles, so save often
     seed: int = 0
 
 
