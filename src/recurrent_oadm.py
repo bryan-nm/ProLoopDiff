@@ -397,7 +397,12 @@ def filip_similarity(zp, zt, prot_keep, text_keep, neg=-1e4):
     """
     zp = F.normalize(zp.float(), dim=-1)
     zt = F.normalize(zt.float(), dim=-1)
-    S = torch.einsum("ilp,jtp->ijlt", zp, zt)                   # (B,B,L,T) all cross-sample pairs
+    # S[i,j,l,t] = <zp[i,l], zt[j,t]>. Computed via a plain 2-D GEMM + reshape instead of a 4-D einsum:
+    # the einsum recompiles per (small, variable) B_lab under mixed batches and faulted on XPU; a GEMM
+    # is robust at any shape. .contiguous() matches the einsum's memory layout for the masked_fill/max below.
+    B, L, p = zp.shape
+    T = zt.shape[1]
+    S = (zp.reshape(B * L, p) @ zt.reshape(B * T, p).t()).reshape(B, L, B, T).permute(0, 2, 1, 3).contiguous()
 
     # protein -> text : for each residue, best-matching word; then mean over real residues
     St = S.masked_fill(~text_keep[None, :, None, :], neg)
