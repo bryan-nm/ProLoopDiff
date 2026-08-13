@@ -116,7 +116,7 @@ def oadm_loss(logits: torch.Tensor, tokens: torch.Tensor, mask_pos: torch.Tensor
 def training_step(model: RecurrentOADM, batch: dict,
                   p_uncond: float = 0.1, lam_filip: float = 0.1,
                   beta: float = 1.0, sub_probs: Optional[torch.Tensor] = None,
-                  beta_schedule: bool = False):
+                  beta_schedule: bool = False, filip_max_rows: Optional[int] = None):
     """
     batch:
       tokens:    (B, L) long
@@ -156,10 +156,16 @@ def training_step(model: RecurrentOADM, batch: dict,
     if lam_filip > 0 and text_emb is not None and int(labelled.sum()) >= 2 and filip_pairs:
         # Align text to true residues only -- exclude EOS/PAD (they are not part of the description).
         prot_keep = target_mask & (tokens != cfg.eos_token_id) & (tokens != cfg.pad_token_id)
-        lab = labelled
+        # Select labelled rows via index_select on explicit indices (XPU-robust; mixed batches newly
+        # exercise a partial boolean-row gather). Cap the count so FiLIP's (B_lab^2, L, T) similarity
+        # transient stays bounded regardless of micro_batch -- otherwise it can blow HBM at large batch.
+        lab_idx = labelled.nonzero(as_tuple=True)[0]
+        if filip_max_rows is not None and lab_idx.numel() > filip_max_rows:
+            lab_idx = lab_idx[:filip_max_rows]
+        pk, tk = prot_keep.index_select(0, lab_idx), text_keep.index_select(0, lab_idx)
         acc = 0.0
         for z_pre, zt_real in filip_pairs:                             # one pair per PB layer
-            acc = acc + filip_loss(z_pre[lab], zt_real[lab], prot_keep[lab], text_keep[lab])
+            acc = acc + filip_loss(z_pre.index_select(0, lab_idx), zt_real.index_select(0, lab_idx), pk, tk)
         L_filip = acc / len(filip_pairs)
 
     total = L_oadm + lam_filip * L_filip

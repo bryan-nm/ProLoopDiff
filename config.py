@@ -62,6 +62,7 @@ class OptCfg:
     # objective
     p_uncond: float = 0.15               # CFG dropout on labelled rows
     lam_filip: float = 0.2               # FiLIP auxiliary weight
+    filip_max_rows: int = 16             # cap labelled rows in FiLIP -> bounds its (B_lab^2,L,T) HBM transient
     beta: float = 0.5                    # hybrid substitution floor (low-corruption)
     beta_schedule: bool = True           # corruption-level beta (absorbing at high corruption)
     blosum_temp: float = 1.0             # BLOSUM substitution sharpness (inf -> uniform)

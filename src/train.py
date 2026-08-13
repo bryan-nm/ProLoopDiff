@@ -176,7 +176,8 @@ def main():
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
                 loss, m = training_step(model, batch, p_uncond=ocfg.p_uncond, lam_filip=ocfg.lam_filip,
-                                        beta=ocfg.beta, sub_probs=sub_probs, beta_schedule=ocfg.beta_schedule)
+                                        beta=ocfg.beta, sub_probs=sub_probs, beta_schedule=ocfg.beta_schedule,
+                                        filip_max_rows=ocfg.filip_max_rows)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), ocfg.grad_clip)
             average_gradients(model)
