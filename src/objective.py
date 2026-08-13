@@ -100,13 +100,17 @@ def sample_corruption(tokens, target_mask, mask_id, beta: float = 1.0,
     return corrupted, corrupt_pos
 
 
-def oadm_loss(logits: torch.Tensor, tokens: torch.Tensor, mask_pos: torch.Tensor) -> torch.Tensor:
-    """Mean-over-masked NLL per sequence (the 1/n ELBO weight), then mean over the batch."""
+def oadm_loss(logits, tokens, mask_pos, pad_id=None, pad_weight=1.0):
+    """Weighted mean-over-masked NLL per sequence (the 1/n ELBO weight), then mean over the batch.
+    PAD positions can be down-weighted (pad_weight < 1) so a large fixed canvas's PAD tail does not
+    swamp the AA/EOS signal, while still being scored (needed for generation from an all-MASK canvas)."""
     B, L, V = logits.shape
     ce = F.cross_entropy(logits.reshape(-1, V).float(), tokens.reshape(-1),
                          reduction="none").reshape(B, L)
-    ce = ce * mask_pos
-    per_seq = ce.sum(dim=1) / mask_pos.sum(dim=1).clamp(min=1)
+    w = mask_pos.float()
+    if pad_id is not None and pad_weight != 1.0:
+        w = w * torch.where(tokens == pad_id, torch.full_like(w, pad_weight), torch.ones_like(w))
+    per_seq = (ce * w).sum(dim=1) / w.sum(dim=1).clamp(min=1e-6)
     return per_seq.mean()
 
 
@@ -116,7 +120,8 @@ def oadm_loss(logits: torch.Tensor, tokens: torch.Tensor, mask_pos: torch.Tensor
 def training_step(model: RecurrentOADM, batch: dict,
                   p_uncond: float = 0.1, lam_filip: float = 0.1,
                   beta: float = 1.0, sub_probs: Optional[torch.Tensor] = None,
-                  beta_schedule: bool = False, filip_max_rows: Optional[int] = None):
+                  beta_schedule: bool = False, filip_max_rows: Optional[int] = None,
+                  pad_loss_weight: float = 1.0):
     """
     batch:
       tokens:    (B, L) long
@@ -134,8 +139,10 @@ def training_step(model: RecurrentOADM, batch: dict,
     B, L = tokens.shape
     device = tokens.device
 
-    # Generative targets = every modelled canvas position (AA + EOS + PAD). EOS/PAD are predicted:
-    # that is how the model learns to emit length. (canvas_mask excludes only true beyond-bucket filler.)
+    # Generative targets = every modelled canvas position (AA + EOS + PAD). PAD IS masked/scored so the
+    # model learns to emit the PAD tail from an all-MASK canvas at generation (gen consistency). Its loss
+    # weight is down-scaled (pad_loss_weight, applied in oadm_loss) so the fixed-512 canvas's PAD tail
+    # doesn't swamp the AA/EOS signal.
     target_mask = canvas_mask if canvas_mask is not None else torch.ones_like(tokens, dtype=torch.bool)
 
     # --- CFG dropout: which rows condition on real text this step ---
@@ -149,7 +156,7 @@ def training_step(model: RecurrentOADM, batch: dict,
     logits, filip_pairs = model(corrupted, text_emb=text_emb, text_keep=text_keep,
                                 cond_mask=cond_mask, canvas_mask=canvas_mask, collect_filip="last")
 
-    L_oadm = oadm_loss(logits, tokens, mask_pos)
+    L_oadm = oadm_loss(logits, tokens, mask_pos, pad_id=cfg.pad_token_id, pad_weight=pad_loss_weight)
 
     # --- FiLIP over the labelled sub-batch (needs >= 2 for a contrastive signal) ---
     L_filip = tokens.new_zeros((), dtype=torch.float32)

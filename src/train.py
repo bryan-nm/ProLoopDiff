@@ -20,7 +20,7 @@ from .recurrent_oadm import RecurrentOADM, count_params
 from .objective import training_step
 from .blosum import blosum_sub_probs
 from .data import (ProteinTokenizer, DummyTextEmbedder, HFTextEmbedder, CacheTextEmbedder, ProteinShards,
-                   load_swissprot, MixedProteinDataset, BucketedBatchSampler, make_collate)
+                   load_swissprot, MixedProteinDataset, FixedCompositionSampler, make_collate)
 
 try:
     import intel_extension_for_pytorch as ipex
@@ -129,15 +129,24 @@ def main():
             else HFTextEmbedder(TEXT_ENCODER, dcfg.max_text_tokens, device="cpu")
 
     mb = 4 if args.smoke else ocfg.micro_batch
-    sampler = BucketedBatchSampler(ds.lengths, mb,               # ds.lengths is a precomputed numpy array
-                                   rank=env.rank, world=env.world_size, seed=ocfg.seed)
+    if ds.n_un == 0:                                             # pure-labelled (e.g. smoke)
+        n_lab, n_unlab = mb, 0
+    elif ds.n_sp_target == 0:                                    # pure-unlabelled
+        n_lab, n_unlab = 0, mb
+    else:
+        n_lab = max(2, round(mb * dcfg.p_swissprot))            # >=2 so FiLIP always has a contrastive signal
+        n_unlab = mb - n_lab
+    sampler = FixedCompositionSampler(ds.n_sp_target, ds.n_un, ds.n_sp_target, n_lab, n_unlab,
+                                      rank=env.rank, world=env.world_size, seed=ocfg.seed)
     # A live HF encoder holds a torch model that can't be forked to workers; the cache reader is fork-safe.
     nw = 0 if (args.smoke or isinstance(embedder, HFTextEmbedder)) else dcfg.num_workers
-    loader = torch.utils.data.DataLoader(ds, batch_sampler=sampler, collate_fn=make_collate(embedder, mcfg),
-                                         num_workers=nw)
+    loader = torch.utils.data.DataLoader(
+        ds, batch_sampler=sampler, num_workers=nw,
+        collate_fn=make_collate(embedder, mcfg, dcfg.pad_protein_to, dcfg.max_text_tokens))
     if env.is_main:
         print(f"[train] swissprot={len(sp_rows)} unannotated={len(unannot)} mixed={len(ds)} "
-              f"text={'cache' if has_cache else type(embedder).__name__} batches/epoch/rank={len(sampler)}", flush=True)
+              f"text={'cache' if has_cache else type(embedder).__name__} comp={n_lab}L+{n_unlab}U "
+              f"(pad L={dcfg.pad_protein_to} T={dcfg.max_text_tokens}) batches/epoch/rank={len(sampler)}", flush=True)
 
     # --- optimizer + ipex; build the LR scheduler AFTER ipex.optimize so it binds to the optimizer
     #     that actually steps (removes the "optimizer.step() overridden after scheduler init" warning
@@ -183,7 +192,7 @@ def main():
                 loss, m = training_step(model, batch, p_uncond=ocfg.p_uncond,
                                         lam_filip=0.0 if args.no_filip else ocfg.lam_filip,
                                         beta=ocfg.beta, sub_probs=sub_probs, beta_schedule=ocfg.beta_schedule,
-                                        filip_max_rows=ocfg.filip_max_rows)
+                                        filip_max_rows=ocfg.filip_max_rows, pad_loss_weight=ocfg.pad_loss_weight)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), ocfg.grad_clip)
             average_gradients(model)

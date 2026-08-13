@@ -266,18 +266,54 @@ class BucketedBatchSampler(torch.utils.data.Sampler):
         return self.n_batches // self.world
 
 
-def make_collate(embedder, cfg_model):
+class FixedCompositionSampler(torch.utils.data.Sampler):
+    """Each batch = a FIXED n_lab labelled + n_unlab unlabelled rows, arranged [labelled..., unlabelled...],
+    so B_lab and the `labelled` mask pattern are CONSTANT every step (static shapes for XPU / FiLIP).
+    Labelled dataset indices are [0, n_lab_total); unlabelled are [sp_offset, sp_offset + n_un_total)."""
+    def __init__(self, n_lab_total, n_un_total, sp_offset, n_lab, n_unlab, rank=0, world=1, seed=0):
+        self.n_lab_total, self.n_un_total, self.sp_offset = n_lab_total, n_un_total, sp_offset
+        self.n_lab, self.n_unlab = n_lab, n_unlab
+        self.rank, self.world, self.seed, self.epoch = rank, world, seed, 0
+        nb_lab = (n_lab_total // n_lab) if n_lab else 1 << 60
+        nb_un = (n_un_total // n_unlab) if n_unlab else 1 << 60
+        self.n_batches = int(min(nb_lab, nb_un))
+
+    def set_epoch(self, e):
+        self.epoch = e
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)          # same on every rank -> consistent batches
+        lab = rng.permutation(self.n_lab_total) if self.n_lab else None
+        un = rng.permutation(self.n_un_total) if self.n_unlab else None
+        for b in range(self.rank, self.n_batches, self.world):        # this rank's batches
+            batch = []
+            if self.n_lab:
+                batch += lab[b * self.n_lab:(b + 1) * self.n_lab].tolist()
+            if self.n_unlab:
+                batch += (self.sp_offset + un[b * self.n_unlab:(b + 1) * self.n_unlab]).tolist()
+            yield batch
+
+    def __len__(self):
+        return self.n_batches // self.world
+
+
+def make_collate(embedder, cfg_model, pad_protein_to, max_text_tokens):
     pad = cfg_model.pad_token_id
 
     def collate(samples):
-        L = max(len(s["ids"]) for s in samples)
         B = len(samples)
-        tokens = torch.full((B, L), pad, dtype=torch.long)
+        tokens = torch.full((B, pad_protein_to), pad, dtype=torch.long)   # FIXED canvas length
         for i, s in enumerate(samples):
-            tokens[i, :len(s["ids"])] = torch.tensor(s["ids"])
+            ids = s["ids"][:pad_protein_to]
+            tokens[i, :len(ids)] = torch.tensor(ids)
         labelled = torch.tensor([s["labelled"] for s in samples])
-        # Text: cache-gather by text_idx (precompute) or live encode; unlabelled rows -> zero + keep False.
-        text_emb, text_keep = embedder.encode_samples(samples)
+        text_emb, text_keep = embedder.encode_samples(samples)           # (B, Tb, H), (B, Tb)
+        Tb = text_emb.shape[1]                                           # pad/trim text to FIXED length
+        if Tb < max_text_tokens:
+            text_emb = torch.nn.functional.pad(text_emb, (0, 0, 0, max_text_tokens - Tb))
+            text_keep = torch.nn.functional.pad(text_keep, (0, max_text_tokens - Tb))
+        elif Tb > max_text_tokens:
+            text_emb, text_keep = text_emb[:, :max_text_tokens], text_keep[:, :max_text_tokens]
         return {"tokens": tokens, "labelled": labelled, "text_emb": text_emb, "text_keep": text_keep}
 
     return collate

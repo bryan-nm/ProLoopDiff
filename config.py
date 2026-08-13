@@ -38,6 +38,10 @@ CKPT_DIR = os.environ.get("PROTGEN_CKPT_DIR", f"{RUNS_DIR}/checkpoints")
 class DataCfg:
     max_residues: int = 500          # SwissProt build is filtered to 30-500 aa
     max_text_tokens: int = 128       # BiomedBERT caption cap (precompute + cross-attn/FiLIP)
+    # STATIC SHAPES for XPU: every batch is padded to this fixed canvas length and to max_text_tokens,
+    # and batches have a FIXED labelled/unlabelled composition -> the model (and FiLIP) see ONE shape
+    # every step, so IPEX/XPU compiles kernels once instead of recompiling (and faulting) per length.
+    pad_protein_to: int = 512        # >= max_residues + 1 (EOS)
     # Length bucketing keeps the PAD tail short (PAD is modelled+attended for EOS-length).
     bucket_width: int = 32           # sequences batched within a length window of this size
     # Mixed corpus: mostly TrEMBL, but oversample SwissProt so the text/FiLIP pathway sees signal.
@@ -63,6 +67,7 @@ class OptCfg:
     p_uncond: float = 0.15               # CFG dropout on labelled rows
     lam_filip: float = 0.2               # FiLIP auxiliary weight
     filip_max_rows: int = 16             # cap labelled rows in FiLIP -> bounds its (B_lab^2,L,T) HBM transient
+    pad_loss_weight: float = 0.1         # down-weight PAD in OADM loss (fixed-512 canvas has a long PAD tail)
     beta: float = 0.5                    # hybrid substitution floor (low-corruption)
     beta_schedule: bool = True           # corruption-level beta (absorbing at high corruption)
     use_ipex: bool = True                # ipex.optimize: fused/faster but recompiles on new shapes (XPU)
