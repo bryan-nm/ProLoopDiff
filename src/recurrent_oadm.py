@@ -7,9 +7,8 @@ pathway that lives in a low-dimensional *privileged-basis* (PB) subspace.
 
 Design commitments encoded here (see conversation):
   * Trunk = 4 upstream + 8 distinct middle (shared across N recurrence passes) + 4 downstream.
-  * PB layers = a subset of the middle layers (default every other). Text cross-attention and
-    a FiLIP-style late-interaction head both operate in the SAME 16-d PB subspace, so the
-    conditioning entry point and the interpretable subspace coincide.
+  * PB layers = a subset of the middle layers (default every other). Text cross-attention writes
+    into a 16-d PB subspace, so the conditioning entry point and the interpretable subspace coincide.
   * Everything is CFG-ready: pass text_emb=None for the unconditional (null) branch. All
     conditioning enters through zero-initialised gates, so at init the model == a clean
     unconditional OADM and the gates learn how much to open.
@@ -31,16 +30,15 @@ Design commitments encoded here (see conversation):
     defined in a space RoPE provably does not mix. This separation is the whole point — see
     SelfAttention (RoPE here) vs PBConditioning (no RoPE, ever).
 
-(4) FiLIP head compares, token-by-token, the protein's own PB features against a learned
-    projection of BiomedBERT token embeddings into the same 16-d space — a fine-grained
-    (residue x word) late-interaction contrastive signal, usable both as an auxiliary training
-    loss on the annotated (SwissProt) sub-batch and as an interpretability probe.
+(4) Conditioning is learned from the generative loss alone (via CFG and the learned null token).
+    An earlier revision also carried a FiLIP token-level contrastive head on the PB features; it
+    has been removed. If a text/protein alignment objective is wanted again, add it out-of-loop
+    against frozen features rather than as an in-loop contrastive on z.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-import math
 
 import torch
 import torch.nn as nn
@@ -68,7 +66,7 @@ class Config:
     n_recurrence: int = 3         # passes through the middle stack (adaptive-compute knob)
 
     pb_layers: tuple = (1, 3, 5, 7)   # which middle layers are privileged-basis / text-conditioned
-    pb_dim: int = 16                  # dimensionality of the PB / cross-attn / FiLIP subspace
+    pb_dim: int = 16                  # dimensionality of the PB / text cross-attention subspace
     n_pb_heads: int = 2               # heads for the in-PB cross-attention (16/2 = 8-d heads)
 
     text_dim: int = 768           # BiomedBERT-full hidden size (token-level embeddings)
@@ -111,18 +109,34 @@ class SwiGLU(nn.Module):
 # RoPE  (self-attention Q/K only; residual stream & PB subspace never rotated)
 # --------------------------------------------------------------------------------------
 class RotaryEmbedding(nn.Module):
+    """Cos/sin tables for RoPE.
+
+    inv_freq is deliberately NOT a registered buffer: ipex.optimize(dtype=bfloat16) casts float
+    buffers along with parameters, and a bf16 inv_freq costs up to ~1.9 rad of phase error by
+    position 511 -- i.e. RoPE's high-frequency bands become noise. It is rebuilt in fp32 here.
+
+    The (L, device, dtype) tables are cached because this runs once per self-attention (32x per
+    forward at n_recurrence=3) and length bucketing means only a handful of distinct L ever occur.
+    """
     def __init__(self, head_dim: int, base: float = 10000.0):
         super().__init__()
         assert head_dim % 2 == 0, "RoPE needs an even head_dim"
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.head_dim, self.base = head_dim, base
+        self._cache: dict = {}                           # (L, device, dtype) -> (cos, sin)
 
     def forward(self, seq_len: int, device, dtype):
+        key = (seq_len, device, dtype)
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.head_dim, 2, device=device,
+                                                     dtype=torch.float32) / self.head_dim))
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, self.inv_freq)            # (L, hd/2)
+        freqs = torch.outer(t, inv_freq)                 # (L, hd/2)
         emb = torch.cat((freqs, freqs), dim=-1)          # (L, hd)  split-half convention
         cos = emb.cos()[None, None, :, :].to(dtype)      # (1,1,L,hd)
         sin = emb.sin()[None, None, :, :].to(dtype)
+        self._cache[key] = (cos, sin)
         return cos, sin
 
 
@@ -209,13 +223,12 @@ class PBConditioning(nn.Module):
     """
     The privileged-basis conditioning module. Structural (present conditional OR unconditional):
         z      = act(down(x))         # 16-d PB features derived from the residual stream (RoPE-free)
-        z_pre  = z                    # exposed to the FiLIP head BEFORE any text is written in
         z     += tanh(g_x) * xattn(z, text)     # text writes into the PB subspace (gated)
         x     += tanh(g_up) * up(z)             # PB subspace written back to residual (zero-init gate)
 
     The elementwise `act` in 16-d is what makes the basis *privileged* (standard axes are special).
     Superposition can still occur (cf. Toy Models), but features prefer to axis-align, which is what
-    makes the FiLIP alignment and any later SAE-style read-out meaningful.
+    makes any later SAE-style read-out of this subspace meaningful.
     """
     def __init__(self, cfg: Config):
         super().__init__()
@@ -243,11 +256,9 @@ class PBConditioning(nn.Module):
         # unconditional pass flows through the same cross-attention path (attending to null)
         # rather than skipping it. That is what makes CFG's (cond - uncond) well-calibrated.
         z = self.act(self.down(x_normed))         # (B,L,p) privileged-basis protein features
-        z_pre = z                                 # for FiLIP: the protein's *own* representation
         zt = self.text_proj(te)                   # (B, 1+T, p) text (+ null slot) in the PB subspace
         z = z + torch.tanh(self.g_cross) * self.cross_norm(self.cross(z, zt, gen_keep))
-        delta = torch.tanh(self.g_up) * self.up_norm(self.up(z))   # (B,L,d)
-        return delta, z_pre, zt
+        return torch.tanh(self.g_up) * self.up_norm(self.up(z))    # delta (B,L,d)
 
 
 # --------------------------------------------------------------------------------------
@@ -265,7 +276,7 @@ class Block(nn.Module):
     def forward(self, x, keep_mask, *_):
         x = x + self.attn(self.n1(x), keep_mask)
         x = x + self.ff(self.n2(x))
-        return x, None, None
+        return x
 
 
 class PBBlock(nn.Module):
@@ -282,9 +293,7 @@ class PBBlock(nn.Module):
     def forward(self, x, keep_mask, te, gen_keep):
         x = x + self.attn(self.n1(x), keep_mask)
         x = x + self.ff(self.n2(x))
-        delta, z_pre, zt = self.pb(self.npb(x), te, gen_keep)
-        x = x + delta
-        return x, z_pre, zt
+        return x + self.pb(self.npb(x), te, gen_keep)
 
 
 # --------------------------------------------------------------------------------------
@@ -322,16 +331,15 @@ class RecurrentOADM(nn.Module):
     def _build_text(self, text_emb, text_keep, cond_mask, B, device):
         """Prepend the learned null token and build the per-row generative keep mask.
 
-        Returns te (B, 1+T, text_dim), gen_keep (B, 1+T) bool, n_real (int).
+        Returns te (B, 1+T, text_dim), gen_keep (B, 1+T) bool.
           * uncond rows (cond_mask False) attend ONLY the null slot.
           * cond rows attend ONLY their real text tokens (null slot masked off).
-        Note: the projection of the real tokens is still computed for every row (masking only
-        affects the cross-attention softmax), so FiLIP can use real text even on CFG-dropped rows.
+        Every row keeps at least one slot, so no cross-attention row is fully masked.
         """
         null = self.null_text.view(1, 1, -1).expand(B, 1, -1)          # (B,1,text_dim)
         if text_emb is None:                                          # fully unconditional
             keep = torch.ones(B, 1, dtype=torch.bool, device=device)
-            return null, keep, 0
+            return null, keep
         T = text_emb.shape[1]
         text_emb = text_emb.to(null.dtype)
         if text_keep is None:
@@ -341,10 +349,10 @@ class RecurrentOADM(nn.Module):
         cm = cond_mask.view(B, 1)
         te = torch.cat([null, text_emb], dim=1)                       # (B, 1+T, text_dim)
         keep = torch.cat([~cm, text_keep & cm], dim=1)                # (B, 1+T)
-        return te, keep, T
+        return te, keep
 
     def forward(self, tokens, text_emb=None, text_keep=None, cond_mask=None,
-                canvas_mask=None, n_recurrence=None, collect_filip="last"):
+                canvas_mask=None, n_recurrence=None):
         """
         tokens:      (B, L) long, includes MASK where unknown; EOS marks length; PAD after EOS
                      is a MODELLED, attended token (predicted as PAD), not attention filler.
@@ -355,75 +363,29 @@ class RecurrentOADM(nn.Module):
         canvas_mask: (B, L) bool, True = position is part of the modelled canvas (AA/EOS/PAD).
                      None -> full attention (every position modelled). Set it only when the batch
                      has true beyond-canvas filler (e.g. padding past a length bucket's width).
-        returns:     logits (B, L, vocab), filip_pairs [(z_pre (B,L,p), zt_real (B,T,p)), ...]
+        returns:     logits (B, L, vocab)
         """
         cfg = self.cfg
         B, L = tokens.shape
         N = n_recurrence or cfg.n_recurrence
         keep_mask = canvas_mask                                 # None -> full (bidirectional) attention
 
-        te, gen_keep, n_real = self._build_text(text_emb, text_keep, cond_mask, B, tokens.device)
+        te, gen_keep = self._build_text(text_emb, text_keep, cond_mask, B, tokens.device)
 
         x = self.embed(tokens)
         for l in self.up_layers:
-            x, _, _ = l(x, keep_mask)
+            x = l(x, keep_mask)
         h_up = x                                                # upstream output for re-injection
 
-        filip_pairs = []
-        for step in range(N):
+        for _ in range(N):
             x = x + torch.tanh(self.reinject_gate) * h_up       # gated re-injection each pass
             for l in self.mid_layers:
-                x, z_pre, zt = l(x, keep_mask, te, gen_keep)
-                take = (collect_filip == "all") or (collect_filip == "last" and step == N - 1)
-                if take and n_real > 0 and z_pre is not None:
-                    filip_pairs.append((z_pre, zt[:, 1:, :]))   # drop null slot -> real text only
+                x = l(x, keep_mask, te, gen_keep)
 
         for l in self.down_layers:
-            x, _, _ = l(x, keep_mask)
+            x = l(x, keep_mask)
 
-        logits = self.lm_head(self.final_norm(x))
-        return logits, filip_pairs
-
-
-# --------------------------------------------------------------------------------------
-# FiLIP-style token-level (residue x word) late interaction
-# --------------------------------------------------------------------------------------
-def filip_similarity(zp, zt, prot_keep, text_keep, neg=-1e4):
-    """
-    zp: (B, L, p) protein PB features        prot_keep: (B, L) bool True=real residue
-    zt: (B, T, p) text-in-PB features        text_keep: (B, T) bool True=real word
-    Returns sim (B, B): rows = proteins, cols = texts; sim[i, j] is the FiLIP score of
-    protein i against text j (max-over-tokens, mean-over-query-tokens, both directions).
-    """
-    zp = F.normalize(zp.float(), dim=-1)
-    zt = F.normalize(zt.float(), dim=-1)
-    # S[i,j,l,t] = <zp[i,l], zt[j,t]>. Computed via a plain 2-D GEMM + reshape instead of a 4-D einsum:
-    # the einsum recompiles per (small, variable) B_lab under mixed batches and faulted on XPU; a GEMM
-    # is robust at any shape. .contiguous() matches the einsum's memory layout for the masked_fill/max below.
-    B, L, p = zp.shape
-    T = zt.shape[1]
-    S = (zp.reshape(B * L, p) @ zt.reshape(B * T, p).t()).reshape(B, L, B, T).permute(0, 2, 1, 3).contiguous()
-
-    # protein -> text : for each residue, best-matching word; then mean over real residues
-    St = S.masked_fill(~text_keep[None, :, None, :], neg)
-    p2t = St.max(dim=-1).values                                # (B,B,L)
-    pk = prot_keep[:, None, :].float()                         # (B,1,L)
-    p2t = (p2t * pk).sum(-1) / pk.sum(-1).clamp(min=1.0)       # (B,B)
-
-    # text -> protein : for each word, best-matching residue; then mean over real words
-    Sp = S.masked_fill(~prot_keep[:, None, :, None], neg)
-    t2p = Sp.max(dim=-2).values                                # (B,B,T)
-    tk = text_keep[None, :, :].float()                         # (1,B,T)
-    t2p = (t2p * tk).sum(-1) / tk.sum(-1).clamp(min=1.0)       # (B,B)
-
-    return 0.5 * (p2t + t2p)
-
-
-def filip_loss(zp, zt, prot_keep, text_keep, temperature=0.07):
-    """Symmetric InfoNCE over the (matched) protein/text batch. Apply on the annotated sub-batch."""
-    sim = filip_similarity(zp, zt, prot_keep, text_keep) / temperature
-    labels = torch.arange(sim.shape[0], device=sim.device)
-    return 0.5 * (F.cross_entropy(sim, labels) + F.cross_entropy(sim.t(), labels))
+        return self.lm_head(self.final_norm(x))
 
 
 # --------------------------------------------------------------------------------------
@@ -451,13 +413,9 @@ if __name__ == "__main__":
     autocast_dev = device if device in ("xpu", "cuda", "cpu") else "cpu"
     with torch.autocast(device_type=autocast_dev, dtype=torch.bfloat16, enabled=(device != "cpu")):
         # conditional
-        logits, pairs = model(tokens, text_emb, text_keep, collect_filip="last")
-        # unconditional (CFG null branch) — no text pathway engaged
-        logits_u, _ = model(tokens, text_emb=None, text_keep=None)
+        logits = model(tokens, text_emb, text_keep)
+        # unconditional (CFG null branch) — attends the learned null token instead of real text
+        logits_u = model(tokens, text_emb=None, text_keep=None)
 
-    print("logits:", tuple(logits.shape), "| filip pairs:", len(pairs))
-    prot_keep = tokens != cfg.pad_token_id
-    zp, zt = pairs[-1]
-    loss = filip_loss(zp.float(), zt.float(), prot_keep, text_keep)
-    print("FiLIP loss:", loss.detach().item())
+    print("logits:", tuple(logits.shape))
     print("CFG delta ||cond-uncond||:", (logits - logits_u).float().norm().detach().item())

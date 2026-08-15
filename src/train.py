@@ -8,6 +8,7 @@ Launch (Aurora): via train.pbs (mpiexec, one rank per tile). Local smoke:
     PROTGEN_SWISSPROT_CSV=... python train.py --smoke
 """
 from __future__ import annotations
+import io
 import os
 import math
 import time
@@ -15,9 +16,11 @@ import argparse
 import torch
 
 from config import CFG, SWISSPROT_CSV, UNANNOTATED_SHARDS, TEXT_ENCODER, TEXT_CACHE, BLOSUM_MAT, CKPT_DIR
-from .dist import init_distributed, barrier, cleanup, broadcast_parameters, average_gradients
+from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
+                   any_rank, broadcast_checkpoint_bytes)
 from .recurrent_oadm import RecurrentOADM, count_params
 from .objective import training_step
+from .sampler import generate
 from .blosum import blosum_sub_probs
 from .data import (ProteinTokenizer, DummyTextEmbedder, HFTextEmbedder, CacheTextEmbedder, ProteinShards,
                    load_swissprot, MixedProteinDataset, BucketedLengthSampler, make_collate)
@@ -89,6 +92,50 @@ def _peak_mem_gb(dev):
     return 0.0
 
 
+# --- periodic generative eval -------------------------------------------------------------
+def _rng_snapshot(dev):
+    return torch.random.get_rng_state(), (torch.xpu.get_rng_state() if dev.type == "xpu" else
+                                          torch.cuda.get_rng_state() if dev.type == "cuda" else None)
+
+
+def _rng_restore(snap, dev):
+    cpu_state, dev_state = snap
+    torch.random.set_rng_state(cpu_state)
+    if dev_state is not None:
+        (torch.xpu if dev.type == "xpu" else torch.cuda).set_rng_state(dev_state)
+
+
+@torch.no_grad()
+def eval_sample_lengths(model, dev, n, canvas, steps, seed=1234):
+    """Sample `n` sequences unconditionally and report their length distribution.
+
+    Length is emergent here (the model decides by placing EOS), so it is the first generative
+    property worth watching and the loss curve cannot tell you about it. Returns
+    (mean, stdev, n_no_eos) where n_no_eos counts rows that never emitted EOS -- those come back as
+    the full canvas width, so without that count a "mean 512" is indistinguishable from a genuine
+    long-sequence distribution. Hook oracle metrics onto the returned tokens later.
+
+    RNG is snapshotted, fixed, and restored, which buys two things: the training stream is bit-identical
+    whether or not eval runs (so eval settings never perturb the trajectory), and every eval draws the
+    SAME decode noise, making the trend across checkpoints a paired comparison instead of a noisy one.
+
+    Every rank runs this and only rank 0 prints. Ranks would otherwise idle inside the next collective
+    while rank 0 sampled; doing it in lockstep costs the same wall time and avoids a 192-way straggler.
+    (Giving each rank its own seed and all-reducing the moments would widen the sample to n*world for
+    free, if tighter statistics are ever wanted.)
+    """
+    snap = _rng_snapshot(dev)
+    torch.manual_seed(seed)
+    try:
+        _, lengths = generate(model, Lmax=canvas, batch_size=n, text_emb=None, cfg_weight=0.0,
+                              n_steps=steps, temperature=1.0, gumbel_temp=0.1, greedy=False,
+                              device=str(dev))
+    finally:
+        _rng_restore(snap, dev)
+    lens = torch.tensor(lengths, dtype=torch.float32)
+    return lens.mean().item(), lens.std().item(), int((lens >= canvas).sum())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default=CFG.device)
@@ -96,8 +143,8 @@ def main():
     ap.add_argument("--fresh", action="store_true", help="ignore any existing checkpoint and start from step 0")
     ap.add_argument("--max-steps", type=int, default=None, help="override total_steps (e.g. debug-queue validation)")
     ap.add_argument("--no-ipex", action="store_true", help="skip ipex.optimize (eager XPU; robust to dynamic shapes)")
-    ap.add_argument("--no-filip", action="store_true", help="disable the FiLIP auxiliary loss (isolation)")
-    ap.add_argument("--filip-cpu", action="store_true", help="compute FiLIP on CPU (sidesteps XPU FiLIP kernel fault)")
+    ap.add_argument("--eval-every", type=int, default=None,
+                    help="override opt.eval_every for the sampling eval (0 disables it)")
     args = ap.parse_args()
 
     env = init_distributed(args.device)
@@ -125,14 +172,16 @@ def main():
     has_cache = os.path.exists(os.path.join(TEXT_CACHE, "fingerprint.json"))
     if has_cache:
         embedder = CacheTextEmbedder(TEXT_CACHE)
-        if not args.smoke and len(embedder) != len(sp_rows) and env.is_main:
+        # Every rank raises: failing on rank 0 alone leaves the other ranks blocked in a collective
+        # until the job hits its walltime, with the real error buried on one rank's stream.
+        if not args.smoke and len(embedder) != len(sp_rows):
             raise RuntimeError(f"text cache has {len(embedder)} rows but SwissProt has {len(sp_rows)}; "
                                f"re-run precompute_text (order must match load_swissprot).")
     else:
         use_dummy = args.smoke or not os.path.isdir(TEXT_ENCODER)
         if use_dummy and not args.smoke and env.is_main:
             print(f"[train] WARNING: no text cache and TEXT_ENCODER {TEXT_ENCODER!r} not found -> DUMMY "
-                  f"embeddings; text/FiLIP learns nothing. Run src.precompute_text or set PROTGEN_TEXT_ENCODER.",
+                  f"embeddings; the text pathway learns nothing. Run src.precompute_text or set PROTGEN_TEXT_ENCODER.",
                   flush=True)
         embedder = DummyTextEmbedder(mcfg.text_dim, dcfg.max_text_tokens) if use_dummy \
             else HFTextEmbedder(TEXT_ENCODER, dcfg.max_text_tokens, device="cpu")
@@ -144,7 +193,8 @@ def main():
     nw = 0 if (args.smoke or isinstance(embedder, HFTextEmbedder)) else dcfg.num_workers
     loader = torch.utils.data.DataLoader(
         ds, batch_sampler=sampler, num_workers=nw,
-        collate_fn=make_collate(embedder, mcfg, dcfg.length_buckets, dcfg.max_text_tokens))
+        collate_fn=make_collate(embedder, mcfg, dcfg.length_buckets, dcfg.max_text_tokens),
+        **({"prefetch_factor": dcfg.prefetch_factor} if nw > 0 else {}))
     if env.is_main:
         print(f"[train] swissprot={len(sp_rows)} unannotated={len(unannot)} mixed={len(ds)} "
               f"text={'cache' if has_cache else type(embedder).__name__} tok_budget={token_budget} "
@@ -155,17 +205,28 @@ def main():
     #     and any doubt about whether the schedule reaches the stepping optimizer) ---
     opt = torch.optim.AdamW(model.parameters(), lr=ocfg.lr, weight_decay=ocfg.weight_decay, betas=(0.9, 0.98))
     use_ipex = ocfg.use_ipex and not args.no_ipex
-    if ipex is not None and dev.type == "xpu" and use_ipex:
+    applied_ipex = ipex is not None and dev.type == "xpu" and use_ipex
+    if applied_ipex:
         model, opt = ipex.optimize(model, optimizer=opt, dtype=torch.bfloat16)
-    elif env.is_main:
-        print(f"[train] ipex.optimize {'ON' if use_ipex else 'OFF (eager XPU)'}", flush=True)
+    if env.is_main:
+        # Report what actually happened. The old message read the config flag, so it printed "ON"
+        # even on a CPU run or when the ipex import had failed -- exactly when you need to know.
+        print(f"[train] ipex.optimize {'ON' if applied_ipex else 'OFF'} (device={dev.type}, "
+              f"requested={use_ipex}, ipex={'available' if ipex is not None else 'missing'})", flush=True)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, ocfg.warmup_steps, ocfg.total_steps))
 
     # --- resume (conv-free model -> ipex keeps state_dict keys stable; opt-state load best-effort) ---
+    # Rank 0 alone resolves latest.txt and reads the file; the bytes go out over the fabric. Every
+    # rank then deserialises an identical payload, so no post-load broadcast_parameters is needed.
+    # weights_only=True is passed explicitly: it is already the default on this torch (2.10) and the
+    # payload is safe under it -- tensors, AdamW state, and LambdaLR state (whose lr_lambdas
+    # serialise as None for plain functions).
     start_step = 0
-    ckpt_path = None if args.fresh else find_latest_ckpt(CKPT_DIR)
-    if ckpt_path:
-        ck = torch.load(ckpt_path, map_location=dev)
+    ckpt_path = find_latest_ckpt(CKPT_DIR) if (env.is_main and not args.fresh) else None
+    raw = None if args.fresh else broadcast_checkpoint_bytes(ckpt_path, dev)
+    if raw is not None:
+        ck = torch.load(io.BytesIO(raw), map_location=dev, weights_only=True)
+        del raw
         model.load_state_dict(ck["model"])
         try:
             opt.load_state_dict(ck["opt"])
@@ -174,15 +235,19 @@ def main():
                 print(f"[ckpt] optimizer state not restored ({ex}); re-warming moments.", flush=True)
         sched.load_state_dict(ck["sched"])
         start_step = int(ck["step"]) + 1
-        broadcast_parameters(model)
         if env.is_main:
             print(f"[ckpt] resumed from {ckpt_path}: continuing at step {start_step}", flush=True)
 
     total = args.max_steps or (60 if args.smoke else ocfg.total_steps)
     log_every = 10 if args.smoke else ocfg.log_every
+    # Smoke runs on CPU, so shrink the eval to something that still exercises the whole path.
+    ev_every = args.eval_every if args.eval_every is not None else (20 if args.smoke else ocfg.eval_every)
+    ev_n, ev_canvas, ev_steps = (8, 128, 8) if args.smoke else (ocfg.eval_n, ocfg.eval_canvas, ocfg.eval_steps)
     use_amp = dev.type in ("xpu", "cuda")
     step = start_step
     tok_win, steps_win, t_win = 0, 0, time.perf_counter()      # throughput window (reset each log)
+    skipped, skip_streak = 0, 0                                # non-finite-gradient updates dropped
+    t_start, t_eval_total = time.perf_counter(), 0.0           # for the measured eval-overhead figure
     model.train()
     while step < total:
         sampler.set_epoch(step)
@@ -192,15 +257,34 @@ def main():
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
                 loss, m = training_step(model, batch, p_uncond=ocfg.p_uncond,
-                                        lam_filip=0.0 if args.no_filip else ocfg.lam_filip,
                                         beta=ocfg.beta, sub_probs=sub_probs, beta_schedule=ocfg.beta_schedule,
-                                        filip_max_rows=ocfg.filip_max_rows, pad_loss_weight=ocfg.pad_loss_weight,
-                                        filip_cpu=args.filip_cpu)
+                                        pad_loss_weight=ocfg.pad_loss_weight)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), ocfg.grad_clip)
+            # Average BEFORE clipping: clipping first clips each rank's local gradient to grad_clip and
+            # then averages, which is not global-norm clipping and biases the step toward the ranks with
+            # the smallest gradients. Order matters at 192 ranks.
             average_gradients(model)
-            opt.step()
-            sched.step()
+            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), ocfg.grad_clip)
+            # A non-finite norm makes clip_grad_norm_'s coefficient NaN, so opt.step() would turn
+            # EVERY parameter NaN -- the run then burns node-hours on garbage and writes poisoned
+            # checkpoints. Skip the update instead (next iteration's zero_grad discards the bad
+            # grads; params and AdamW moments are untouched). Gradients are already all-reduced, so
+            # a NaN on any rank has reached all of them; any_rank() makes the decision unanimous by
+            # construction for one small collective, since a split decision would deadlock the job.
+            if any_rank(~torch.isfinite(total_norm), dev):
+                skipped += 1
+                skip_streak += 1
+                if env.is_main:
+                    print(f"[warn] step {step}: non-finite grad norm -> update skipped "
+                          f"({skip_streak} consecutive, {skipped} total)", flush=True)
+                if skip_streak >= ocfg.max_skip_streak:
+                    raise RuntimeError(
+                        f"{skip_streak} consecutive non-finite gradient norms ending at step {step}; "
+                        f"aborting rather than spinning. Last good checkpoint is in {CKPT_DIR}.")
+            else:
+                skip_streak = 0
+                opt.step()
+            sched.step()                                       # always: LR stays a function of `step`
             tok_win += n_tok
             steps_win += 1
             if env.is_main and step % log_every == 0:
@@ -209,11 +293,26 @@ def main():
                 rate = f"{tok_win / dt / 1e3:.0f}k tok/s | {dt / steps_win:.2f}s/step"
                 peak = _peak_mem_gb(dev)
                 mem = f" | peak {peak:.1f}GB" if peak else ""
-                print(f"step {step:>7} | loss {m['total']:.3f} | oadm {m['oadm']:.3f} | filip {m['filip']:.3f} "
-                      f"| cond {m['n_cond']}/{m['n_labelled']} | lr {sched.get_last_lr()[0]:.2e} | {rate}{mem}", flush=True)
+                # training_step returns on-device 0-d tensors; they are pulled to the host ONLY here.
+                skip = f" | skipped {skipped}" if skipped else ""
+                print(f"step {step:>7} | loss {float(m['oadm']):.3f} "
+                      f"| cond {int(m['n_cond'])}/{int(m['n_labelled'])} "
+                      f"| lr {sched.get_last_lr()[0]:.2e} | {rate}{mem}{skip}", flush=True)
                 tok_win, steps_win, t_win = 0, 0, time.perf_counter()
             if step > 0 and step % ocfg.ckpt_every == 0:
                 save_checkpoint(model, opt, sched, step, CKPT_DIR, env)
+            if ev_every and step > 0 and step % ev_every == 0:
+                t_ev = time.perf_counter()
+                with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
+                    mu, sd, n_no_eos = eval_sample_lengths(model, dev, ev_n, ev_canvas, ev_steps)
+                _device_sync(dev)
+                dt_ev = time.perf_counter() - t_ev
+                t_eval_total += dt_ev
+                t_win += dt_ev                                 # keep eval out of the tok/s window
+                if env.is_main:
+                    frac = 100 * t_eval_total / max(time.perf_counter() - t_start, 1e-9)
+                    print(f"[eval] step {step} | len mean {mu:.1f} sd {sd:.1f} | no-EOS "
+                          f"{n_no_eos}/{ev_n} | {dt_ev:.1f}s ({frac:.1f}% of wall so far)", flush=True)
             step += 1
             if step >= total:
                 break

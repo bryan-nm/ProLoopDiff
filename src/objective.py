@@ -1,20 +1,16 @@
 """
 Training objective for the recurrent OADM protein generator.
 
-Two losses:
-  1. OADM masked-ELBO (the generative objective). Order-agnostic absorbing-state discrete
-     diffusion == any-order autoregressive. Per sequence: sample how many positions to mask,
-     mask that many uniformly at random, and score the mean per-token NLL over the masked set.
-  2. FiLIP token-level contrastive alignment (auxiliary, labelled rows only) — pulls the
-     protein's own PB features toward the projected BiomedBERT description, residue-by-word.
+One loss: the OADM masked-ELBO (the generative objective). Order-agnostic absorbing-state discrete
+diffusion == any-order autoregressive. Per sequence: sample how many positions to mask, mask that
+many uniformly at random, and score the mean per-token NLL over the masked set. Text conditioning
+is learned from this loss alone, through the gated PB cross-attention and CFG dropout.
 
 Data handling:
   * A batch mixes labelled (SwissProt, has text) and unlabelled (TrEMBL, no text) rows.
-  * `cond_mask` decides, per row, whether the *generative* pathway sees real text or the learned
-    null token. Unlabelled rows are always null; labelled rows are null with prob `p_uncond`
+  * `cond_mask` decides, per row, whether the pathway sees real text or the learned null token.
+    Unlabelled rows are always null; labelled rows are null with prob `p_uncond`
     (classifier-free-guidance dropout).
-  * FiLIP uses the real text for ALL labelled rows regardless of CFG dropout (it's a
-    representation-alignment loss on z_pre, independent of the generative conditioning).
 
 --------------------------------------------------------------------------------------------
 OADM ELBO weighting (why "mean over masked, count ~ Uniform"):
@@ -34,7 +30,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from .recurrent_oadm import RecurrentOADM, Config, filip_loss, count_params
+from .recurrent_oadm import RecurrentOADM, Config, count_params
 
 
 # --------------------------------------------------------------------------------------
@@ -67,6 +63,14 @@ def sample_corruption(tokens, target_mask, mask_id, beta: float = 1.0,
     OADM cold-start generation while still training the AA->AA denoising the substitution corrector needs.
 
     Returns (corrupted, corrupt_pos); corrupt_pos are the positions to score (predict x0).
+
+    EVERY tensor here has a shape fixed by (B, L) -- no boolean gathers, no torch.multinomial, no
+    host syncs. The previous version selected the substituted positions with `tokens[do_sub]` and
+    drew replacements with `torch.multinomial`, which made the shapes data-dependent (a different
+    (M, 20) every step, driven by per-rank RNG). That was the last dynamic shape in the training
+    step and the same class of op that faulted the GPU on XPU under FiLIP. Inverse-CDF sampling
+    below is exact, allocation-stable, and cannot return an out-of-range index -- which
+    torch.multinomial can do on a float-rounding edge (index 20 == eos_token_id here).
     """
     B, L = tokens.shape
     device = tokens.device
@@ -77,9 +81,9 @@ def sample_corruption(tokens, target_mask, mask_id, beta: float = 1.0,
     ranks = scores.argsort(dim=1, descending=True).argsort(dim=1)
     corrupt_pos = (ranks < n_corrupt[:, None]) & target_mask
 
-    corrupted = tokens.clone()
+    mask_scalar = tokens.new_full((), mask_id)
+    corrupted = torch.where(corrupt_pos, mask_scalar, tokens)
     if beta >= 1.0 and not beta_schedule:                            # pure absorbing fast path == OADM
-        corrupted[corrupt_pos] = mask_id
         return corrupted, corrupt_pos
 
     if beta_schedule:
@@ -92,12 +96,14 @@ def sample_corruption(tokens, target_mask, mask_id, beta: float = 1.0,
         sub_probs = uniform_sub_probs(num_aa).to(device)
     is_aa = tokens < num_aa                                           # only amino acids can be substituted
     do_sub = corrupt_pos & is_aa & (torch.rand(B, L, device=device) >= beta_row[:, None])
-    do_mask = corrupt_pos & ~do_sub                                  # MASK (includes all corrupted EOS/PAD)
-    corrupted[do_mask] = mask_id
-    if bool(do_sub.any()):
-        x0 = tokens[do_sub]                                          # (M,) original residues
-        corrupted[do_sub] = torch.multinomial(sub_probs[x0], 1).squeeze(1)
-    return corrupted, corrupt_pos
+
+    # Inverse-CDF draw for EVERY position (cheap: B*L is the fixed token budget), then select.
+    # repl = #{j : cdf[x0, j] < r}, i.e. the j with cdf[j-1] <= r < cdf[j]. Non-AA rows index a
+    # valid CDF row via the clamp and are discarded by `do_sub` anyway.
+    cdf = sub_probs.cumsum(dim=-1)                                    # (num_aa, num_aa)
+    r = torch.rand(B, L, 1, device=device)
+    repl = (r > cdf[tokens.clamp(max=num_aa - 1)]).sum(dim=-1).clamp_(max=num_aa - 1)
+    return torch.where(do_sub, repl, corrupted), corrupt_pos
 
 
 def oadm_loss(logits, tokens, mask_pos, pad_id=None, pad_weight=1.0):
@@ -115,20 +121,20 @@ def oadm_loss(logits, tokens, mask_pos, pad_id=None, pad_weight=1.0):
 
 
 # --------------------------------------------------------------------------------------
-# Training step (labelled + unlabelled, CFG dropout, FiLIP)
+# Training step (labelled + unlabelled, CFG dropout)
 # --------------------------------------------------------------------------------------
 def training_step(model: RecurrentOADM, batch: dict,
-                  p_uncond: float = 0.1, lam_filip: float = 0.1,
+                  p_uncond: float = 0.1,
                   beta: float = 1.0, sub_probs: Optional[torch.Tensor] = None,
-                  beta_schedule: bool = False, filip_max_rows: Optional[int] = None,
-                  pad_loss_weight: float = 1.0, filip_cpu: bool = False):
+                  beta_schedule: bool = False, pad_loss_weight: float = 1.0):
     """
     batch:
       tokens:    (B, L) long
       labelled:  (B,) bool     — row has a real text annotation
       text_emb:  (B, T, text_dim) or None  — BiomedBERT token embeddings (garbage rows ok if not labelled)
       text_keep: (B, T) bool or None
-    Returns (total_loss, metrics_dict).
+    Returns (loss, metrics_dict). Metric values stay on-device (0-d tensors): converting them here
+    forced a device->host sync every step for numbers the trainer only prints every log_every steps.
     """
     cfg = model.cfg
     tokens = batch["tokens"]
@@ -153,41 +159,15 @@ def training_step(model: RecurrentOADM, batch: dict,
     corrupted, mask_pos = sample_corruption(tokens, target_mask, cfg.mask_token_id,
                                             beta=beta, sub_probs=sub_probs, beta_schedule=beta_schedule)
 
-    logits, filip_pairs = model(corrupted, text_emb=text_emb, text_keep=text_keep,
-                                cond_mask=cond_mask, canvas_mask=canvas_mask, collect_filip="last")
+    logits = model(corrupted, text_emb=text_emb, text_keep=text_keep,
+                   cond_mask=cond_mask, canvas_mask=canvas_mask)
 
     L_oadm = oadm_loss(logits, tokens, mask_pos, pad_id=cfg.pad_token_id, pad_weight=pad_loss_weight)
 
-    # --- FiLIP over the labelled sub-batch (needs >= 2 for a contrastive signal) ---
-    L_filip = tokens.new_zeros((), dtype=torch.float32)
-    if lam_filip > 0 and text_emb is not None and int(labelled.sum()) >= 2 and filip_pairs:
-        # Align text to true residues only -- exclude EOS/PAD (they are not part of the description).
-        prot_keep = target_mask & (tokens != cfg.eos_token_id) & (tokens != cfg.pad_token_id)
-        # Select labelled rows via index_select on explicit indices (XPU-robust; mixed batches newly
-        # exercise a partial boolean-row gather). Cap the count so FiLIP's (B_lab^2, L, T) similarity
-        # transient stays bounded regardless of micro_batch -- otherwise it can blow HBM at large batch.
-        lab_idx = labelled.nonzero(as_tuple=True)[0]
-        if filip_max_rows is not None and lab_idx.numel() > filip_max_rows:
-            lab_idx = lab_idx[:filip_max_rows]
-        # Optionally run FiLIP entirely on CPU: its tensors are tiny (<=16xLxT), the round-trip is
-        # negligible, and it sidesteps the XPU FiLIP kernel that faults on some batches. autograd bridges
-        # devices, so gradients still flow back to the (XPU) PB features.
-        fdev = torch.device("cpu") if filip_cpu else lab_idx.device
-        li = lab_idx.to(fdev)
-        pk = prot_keep.to(fdev).index_select(0, li)
-        tk = text_keep.to(fdev).index_select(0, li)
-        acc = 0.0
-        for z_pre, zt_real in filip_pairs:                             # one pair per PB layer
-            acc = acc + filip_loss(z_pre.to(fdev).index_select(0, li), zt_real.to(fdev).index_select(0, li), pk, tk)
-        L_filip = acc / len(filip_pairs)
-
-    total = L_oadm + lam_filip * L_filip.to(L_oadm.device)
-    return total, {
-        "total": float(total.detach()),
-        "oadm": float(L_oadm.detach()),
-        "filip": float(L_filip.detach()) if torch.is_tensor(L_filip) else float(L_filip),
-        "n_cond": int(cond_mask.sum()),
-        "n_labelled": int(labelled.sum()),
+    return L_oadm, {
+        "oadm": L_oadm.detach(),
+        "n_cond": cond_mask.sum(),
+        "n_labelled": labelled.sum(),
     }
 
 
@@ -199,10 +179,9 @@ def cfg_guided_logits(model: RecurrentOADM, tokens, text_emb, text_keep, w: floa
     """logits = uncond + w*(cond - uncond). w=0 -> unconditional, w=1 -> plain conditional,
     w>1 -> amplified text adherence. In the sampler this is called each step on the current canvas."""
     B = tokens.shape[0]
-    cond, _ = model(tokens, text_emb=text_emb, text_keep=text_keep,
-                    cond_mask=torch.ones(B, dtype=torch.bool, device=tokens.device),
-                    collect_filip=None)
-    uncond, _ = model(tokens, text_emb=None, collect_filip=None)       # learned null token
+    cond = model(tokens, text_emb=text_emb, text_keep=text_keep,
+                 cond_mask=torch.ones(B, dtype=torch.bool, device=tokens.device))
+    uncond = model(tokens, text_emb=None)                              # learned null token
     return uncond + w * (cond - uncond)
 
 
@@ -222,9 +201,9 @@ def _gate_report(model: RecurrentOADM):
 def _cfg_delta(model, tokens, text_emb, text_keep):
     with torch.no_grad():
         B = tokens.shape[0]
-        cond, _ = model(tokens, text_emb=text_emb, text_keep=text_keep,
-                        cond_mask=torch.ones(B, dtype=torch.bool), collect_filip=None)
-        uncond, _ = model(tokens, text_emb=None, collect_filip=None)
+        cond = model(tokens, text_emb=text_emb, text_keep=text_keep,
+                     cond_mask=torch.ones(B, dtype=torch.bool))
+        uncond = model(tokens, text_emb=None)
     return (cond - uncond).float().norm().item()
 
 
@@ -242,9 +221,9 @@ def _eval_oadm(model, tokens, text_emb, text_keep, cfg, frac=0.5):
     B = tokens.shape[0]
     model.eval()
     with torch.no_grad():
-        cond_logits, _ = model(corrupted, text_emb=text_emb, text_keep=text_keep,
-                               cond_mask=torch.ones(B, dtype=torch.bool), collect_filip=None)
-        unc_logits, _ = model(corrupted, text_emb=None, collect_filip=None)
+        cond_logits = model(corrupted, text_emb=text_emb, text_keep=text_keep,
+                            cond_mask=torch.ones(B, dtype=torch.bool))
+        unc_logits = model(corrupted, text_emb=None)
         l_cond = oadm_loss(cond_logits, tokens, mask_pos).item()
         l_unc = oadm_loss(unc_logits, tokens, mask_pos).item()
     model.train()
@@ -283,14 +262,14 @@ if __name__ == "__main__":
     model.train()
     for step in range(1, 601):
         opt.zero_grad()
-        loss, m = training_step(model, batch, p_uncond=0.1, lam_filip=0.3)
+        loss, m = training_step(model, batch, p_uncond=0.1)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if step % 100 == 0:
             gu, gc, gr = _gate_report(model)
             ec, eu = _eval_oadm(model, tokens, text_emb, text_keep, cfg)
-            print(f"step {step:3d} | eval oadm cond={ec:.3f} uncond={eu:.3f} | filip {m['filip']:.3f} | "
+            print(f"step {step:3d} | eval oadm cond={ec:.3f} uncond={eu:.3f} | "
                   f"gates up={gu:+.3f} cross={gc:+.3f} reinj={gr:+.3f} | "
                   f"cfg_delta={_cfg_delta(model, tokens, text_emb, text_keep):.2f}")
 
@@ -300,11 +279,11 @@ if __name__ == "__main__":
         probe = tokens.clone()
         for i, n in enumerate(lengths):
             probe[i, n:] = cfg.mask_token_id                    # mask EOS + everything after
-        lg, _ = model(probe, text_emb=text_emb, text_keep=text_keep,
-                      cond_mask=torch.ones(B, dtype=torch.bool), collect_filip=None)
+        lg = model(probe, text_emb=text_emb, text_keep=text_keep,
+                   cond_mask=torch.ones(B, dtype=torch.bool))
         pred = lg.argmax(-1)
         eos_at = [int(pred[i, n] == cfg.eos_token_id) for i, n in enumerate(lengths)]
     print(f"EOS predicted at true boundary? {eos_at} (1=yes) for lengths {lengths}")
     print("Expect: conditional OADM loss falls toward ~0 (text lets labelled rows nail their "
-          "C-terminus), uncond falls more slowly, FiLIP -> ~0, gates open (now honest), cfg_delta grows, "
+          "C-terminus), uncond falls more slowly, gates open (now honest), cfg_delta grows, "
           "and EOS lands at the true length.")

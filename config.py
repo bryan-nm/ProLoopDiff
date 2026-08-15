@@ -36,44 +36,61 @@ CKPT_DIR = os.environ.get("PROTGEN_CKPT_DIR", f"{RUNS_DIR}/checkpoints")
 
 @dataclass
 class DataCfg:
-    max_residues: int = 500          # SwissProt build is filtered to 30-500 aa
-    max_text_tokens: int = 128       # BiomedBERT caption cap (precompute + cross-attn/FiLIP)
+    max_text_tokens: int = 128       # BiomedBERT caption cap (precompute + PB cross-attention)
     # STATIC SHAPES for XPU via length BUCKETS: each batch is padded to one of these fixed lengths and to
     # max_text_tokens, with a fixed composition -> a SMALL set of static shapes (one per bucket) that
     # IPEX/XPU compiles once each instead of recompiling per length. Per-batch size B = global_batch_tokens
     # // bucket_len (token budget), so short buckets pack more sequences at ~constant memory and the long
-    # bucket stays memory-safe. The 1024 bucket is empty for the current 30-500 aa set but ready for later.
+    # bucket stays memory-safe. Both corpora are built to 30-500 aa, so the 1024 bucket is empty for the
+    # current data (it would halve B and roughly double attention HBM) but is ready for later.
+    # Length bucketing also keeps the PAD tail short (PAD is modelled+attended for EOS-length).
     length_buckets: tuple = (128, 256, 384, 512, 1024)
-    # Length bucketing keeps the PAD tail short (PAD is modelled+attended for EOS-length).
-    bucket_width: int = 32           # sequences batched within a length window of this size
-    # Mixed corpus: mostly TrEMBL, but oversample SwissProt so the text/FiLIP pathway sees signal.
+    # Mixed corpus: mostly TrEMBL, but oversample SwissProt so the text pathway sees signal.
     # p_swissprot is the probability a training example is drawn from the labelled (text) corpus.
     p_swissprot: float = 0.25
     num_workers: int = 4
-    prefetch_factor: int = 4
+    prefetch_factor: int = 4         # batches prefetched per worker (only used when num_workers > 0)
 
 
 @dataclass
 class OptCfg:
-    global_batch_tokens: int = 32768     # target residues/step summed over the batch (bucketed)
-    # sequences per rank per step. With mixed batches (~p_swissprot labelled), FiLIP negatives ≈
-    # micro_batch * p_swissprot, so 64 gives ~16 labelled/batch (parity with the old homogeneous ~14)
-    # and better tile utilization. Watch HBM on the next debug run; fall back to 32 if it OOMs.
-    micro_batch: int = 64
+    # Per-rank token budget per step; the sampler derives each bucket's batch size as
+    # global_batch_tokens // bucket_len (so B is 256 at L=128 down to 64 at L=512).
+    global_batch_tokens: int = 32768
     lr: float = 3e-4
     warmup_steps: int = 2000
     total_steps: int = 200_000
     weight_decay: float = 0.01
     grad_clip: float = 1.0
+    # A non-finite gradient norm makes clip_grad_norm_'s coefficient NaN, which would turn every
+    # parameter NaN on the next opt.step(). The trainer skips those updates instead; this many
+    # CONSECUTIVE skips means something is structurally wrong, so abort rather than spin.
+    max_skip_streak: int = 20
     # objective
     p_uncond: float = 0.15               # CFG dropout on labelled rows
-    lam_filip: float = 0.2               # FiLIP auxiliary weight
-    filip_max_rows: int = 16             # cap labelled rows in FiLIP -> bounds its (B_lab^2,L,T) HBM transient
+    # NB: the FiLIP token-level contrastive auxiliary has been REMOVED, not just disabled. Its backward
+    # under ipex.optimize at scale intermittently faulted the GPU. Conditioning is learned from the
+    # generative loss + CFG via the PB cross-attention, standard for cross-attn diffusion. If an
+    # alignment objective is wanted again, add it out-of-loop on frozen features.
     pad_loss_weight: float = 0.1         # down-weight PAD in OADM loss (fixed-512 canvas has a long PAD tail)
     beta: float = 0.5                    # hybrid substitution floor (low-corruption)
     beta_schedule: bool = True           # corruption-level beta (absorbing at high corruption)
     use_ipex: bool = True                # ipex.optimize: fused/faster but recompiles on new shapes (XPU)
     blosum_temp: float = 1.0             # BLOSUM substitution sharpness (inf -> uniform)
+    # --- periodic generative eval (unconditional sampling) ---
+    # The OADM loss says nothing about whether the model places EOS sensibly, so sample and measure.
+    # Cost, in training-step equivalents: eval_steps * (eval_n * eval_canvas) / (3 * global_batch_tokens)
+    # -- one training step is fwd+bwd (~3 forward-units) over global_batch_tokens. At 64/100/512 that
+    # is ~33 steps, so eval_every=1000 predicts ~3.3% of wall time (the trainer measures and logs the
+    # real figure, which runs a little higher: eval is all at L=512 while training averages over the
+    # buckets at constant token budget, and attention is quadratic in L).
+    # eval_every=100 would only afford ~9 decoding steps at this width -- ~57 tokens committed per
+    # step, which measures the decode schedule rather than the model. 1000 also aligns with
+    # ckpt_every, so every checkpoint gets a length statistic next to it.
+    eval_every: int = 1000               # 0 disables
+    eval_n: int = 100                    # sequences per eval
+    eval_canvas: int = 512               # largest training bucket = the model's widest length prior
+    eval_steps: int = 64                 # confidence-ordered decoding steps
     # bookkeeping
     log_every: int = 50
     ckpt_every: int = 1000               # ~14min at scale; crashes are common on many tiles, so save often

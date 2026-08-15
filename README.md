@@ -13,8 +13,7 @@ only; text is an optional cross-attention pathway that can be swapped for other 
 - **Conditioning** — a subset of middle layers ("PB layers") project the residual stream into a 16-d
   privileged-basis subspace where frozen-BiomedBERT text is written in via zero-init **gated** cross-attention
   (affine-free RMS norm on the writeback makes the gate the honest throttle). A learned **null token** makes
-  the unconditional pass a calibrated CFG baseline. A **FiLIP** head aligns each PB layer's residue features
-  with the text token-by-token.
+  the unconditional pass a calibrated CFG baseline; conditioning is learned from the generative loss alone.
 - **Length** — the model emits an **EOS** token; its position is the length. PAD after EOS is modelled and
   attended (this is what makes emergent-EOS length work).
 - **Objective** — x0-denoising cross-entropy over a hybrid absorbing↔substitution corruption, parameterised
@@ -31,8 +30,8 @@ See the memory notes / design docs for the full rationale.
 ```
 config.py            # owns ALL paths + model/data/opt config (python config.py prints resolved paths)
 src/
-  recurrent_oadm.py  # model: looped transformer + PB cross-attention + FiLIP head
-  objective.py       # hybrid corruption + OADM/D3PM loss + FiLIP + CFG training_step
+  recurrent_oadm.py  # model: looped transformer + PB text cross-attention
+  objective.py       # hybrid corruption + OADM/D3PM loss + CFG training_step
   sampler.py         # confidence-ordered decoding + CFG + correctors
   blosum.py          # EvoDiff BLOSUM62 -> substitution matrix
   data.py            # tokenizer, text embedders, TrEMBL shards, mixed dataset, bucketing, collate

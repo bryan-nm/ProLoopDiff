@@ -133,18 +133,104 @@ def broadcast_parameters(model, src: int = 0):
             torch.distributed.broadcast(p.data, src=src)
 
 
+_FLAG_BUF = None        # persistent 1-element buffer for any_rank
+
+
+def any_rank(flag, device) -> bool:
+    """OR a per-rank flag across the world and return it on the host.
+
+    `flag` is a Python bool or any 0-d/1-element tensor (nonzero = True). Costs one tiny collective
+    and exactly ONE device->host sync, so the caller can make a control-flow decision (skip a step,
+    abort) that is guaranteed unanimous. Ranks that disagreed about whether to run a collective would
+    deadlock until the walltime, which is why this is a guarantee and not an argument.
+    """
+    global _FLAG_BUF
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return bool(flag) if isinstance(flag, bool) else bool(flag.reshape(-1)[0].item())
+    if _FLAG_BUF is None or _FLAG_BUF.device != device:
+        _FLAG_BUF = torch.zeros(1, dtype=torch.float32, device=device)
+    if isinstance(flag, bool):
+        _FLAG_BUF.fill_(1.0 if flag else 0.0)
+    else:
+        _FLAG_BUF.copy_(flag.reshape(-1)[:1].float())          # stays on device; no sync yet
+    torch.distributed.all_reduce(_FLAG_BUF, op=torch.distributed.ReduceOp.MAX)
+    return bool(_FLAG_BUF.item() > 0)                          # the one sync
+
+
+def broadcast_checkpoint_bytes(path, device, src: int = 0):
+    """Rank `src` reads `path` and broadcasts the raw bytes; every rank returns identical bytes
+    (or None if `path` is None on `src`, i.e. there is no checkpoint to resume).
+
+    Only ONE rank touches the filesystem. Having all 192 ranks torch.load the same ~650MB checkpoint
+    off flare at once is an I/O storm that can stall a job for minutes; a fabric broadcast is far
+    cheaper. It also makes the resume decision unanimous by construction -- if each rank resolved
+    latest.txt itself, a rank that disagreed about whether a checkpoint exists would hang the job.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        if path is None:
+            return None
+        with open(path, "rb") as f:
+            return f.read()
+
+    import numpy as np
+    rank = torch.distributed.get_rank()
+    n = torch.zeros(1, dtype=torch.int64, device=device)
+    arr = None
+    if rank == src:
+        if path is not None:
+            arr = np.fromfile(path, dtype=np.uint8)
+            n[0] = arr.size
+        else:
+            n[0] = -1
+    torch.distributed.broadcast(n, src=src)
+    size = int(n.item())
+    if size < 0:
+        return None
+    buf = torch.empty(size, dtype=torch.uint8, device=device)
+    if rank == src:
+        buf.copy_(torch.from_numpy(arr))
+    torch.distributed.broadcast(buf, src=src)
+    return buf.to("cpu").numpy().tobytes()
+
+
+_GRAD_BUF = None        # persistent coalescing buffer for average_gradients (see below)
+
+
 def average_gradients(model):
     """Manual all-reduce of grads coalesced into one collective (mini-embed convention).
     Safe here because the param-grad set is identical across ranks every step: the conditioning
-    pathway always fires via the learned null token, so no param is ever conditionally unused."""
+    pathway always fires via the learned null token, so no param is ever conditionally unused.
+
+    The coalescing buffer is allocated ONCE and reused. The previous version built it per step with
+    _flatten_dense_tensors and dropped it on return, so a ~100MB block was freed back to the caching
+    allocator the instant the collective was enqueued. oneCCL runs the collective on its own queue,
+    so the allocator could hand that block to the next compute kernel while CCL was still reading it
+    -- a use-after-free that shows up as an intermittent, rank-local GPU page fault. Reusing one
+    buffer removes both the hazard and ~100MB of alloc/free churn (and fragmentation) per step.
+    """
+    global _GRAD_BUF
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return
     world = torch.distributed.get_world_size()
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     if not grads:
         return
-    flat = torch._utils._flatten_dense_tensors(grads)
-    torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.SUM)
-    flat /= world
-    for g, s in zip(grads, torch._utils._unflatten_dense_tensors(flat, grads)):
-        g.copy_(s)
+    dtype, device = grads[0].dtype, grads[0].device
+    if any(g.dtype != dtype or g.device != device for g in grads):
+        raise RuntimeError("average_gradients needs one dtype/device for all grads; got "
+                           f"{sorted({str(g.dtype) for g in grads})} on "
+                           f"{sorted({str(g.device) for g in grads})}")
+    n = sum(g.numel() for g in grads)
+    if _GRAD_BUF is None or _GRAD_BUF.numel() != n or _GRAD_BUF.dtype != dtype or _GRAD_BUF.device != device:
+        _GRAD_BUF = torch.empty(n, dtype=dtype, device=device)
+
+    off = 0
+    for g in grads:
+        _GRAD_BUF[off:off + g.numel()].copy_(g.reshape(-1))
+        off += g.numel()
+    torch.distributed.all_reduce(_GRAD_BUF, op=torch.distributed.ReduceOp.SUM)
+    _GRAD_BUF /= world
+    off = 0
+    for g in grads:
+        g.copy_(_GRAD_BUF[off:off + g.numel()].view_as(g))
+        off += g.numel()

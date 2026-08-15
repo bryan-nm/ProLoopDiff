@@ -39,7 +39,7 @@ def _step_logits(model, canvas, text_emb, text_keep, w, guidance_fn):
     if text_emb is not None and w > 0:
         lg = cfg_guided_logits(model, canvas, text_emb, text_keep, w)
     else:
-        lg, _ = model(canvas, text_emb=None, collect_filip=None)          # unconditional (null token)
+        lg = model(canvas, text_emb=None)                                 # unconditional (null token)
     if guidance_fn is not None:
         lg = guidance_fn(canvas, lg)                                       # ProteinGuide-style hook
     cfg = model.cfg
@@ -237,7 +237,7 @@ if __name__ == "__main__":
     model.train()
     for step in range(800):
         opt.zero_grad()
-        loss, _ = training_step(model, batch, p_uncond=0.1, lam_filip=0.3,
+        loss, _ = training_step(model, batch, p_uncond=0.1,
                                 beta=0.5, sub_probs=sub_probs, beta_schedule=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

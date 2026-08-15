@@ -11,8 +11,6 @@ Design (Aurora conventions from mini-embed-filip):
 from __future__ import annotations
 import os
 import csv
-import random
-from dataclasses import dataclass
 from typing import Optional, List
 import numpy as np
 import torch
@@ -237,35 +235,6 @@ class MixedProteinDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Length bucketing + collate
 # ---------------------------------------------------------------------------
-class BucketedBatchSampler(torch.utils.data.Sampler):
-    """Yield batches of similar-length indices, sharded across ranks. drop_last so per-rank step count
-    matches. The global argsort is computed ONCE (numpy); each epoch only permutes batch order."""
-    def __init__(self, lengths, micro_batch, rank=0, world=1, shuffle=True, seed=0):
-        self.mb, self.rank, self.world = micro_batch, rank, world
-        self.shuffle, self.seed, self.epoch = shuffle, seed, 0
-        lengths = np.asarray(lengths)
-        # Sort by length, breaking ties RANDOMLY (seeded identically on every rank). A stable sort would
-        # keep the concatenated SwissProt block ahead of the corpus block within each length, making
-        # batches all-labelled or all-unlabelled; the random tiebreak interleaves the two sources so
-        # each batch carries ~p_swissprot labelled rows. Same-length only, so padding stays tight.
-        tiebreak = np.random.default_rng(seed).integers(0, 1 << 20, len(lengths), dtype=np.int64)
-        self.order = np.lexsort((tiebreak, lengths)).astype(np.int32)   # primary key = lengths, indices < 2^31
-        self.n_batches = len(self.order) // self.mb
-
-    def set_epoch(self, e):
-        self.epoch = e
-
-    def __iter__(self):
-        perm = (np.random.default_rng(self.seed + self.epoch).permutation(self.n_batches)
-                if self.shuffle else np.arange(self.n_batches))
-        for b in perm[self.rank::self.world]:               # each rank takes every world-th batch
-            s = int(b) * self.mb
-            yield self.order[s:s + self.mb].tolist()
-
-    def __len__(self):
-        return self.n_batches // self.world
-
-
 class BucketedLengthSampler(torch.utils.data.Sampler):
     """Length-bucketed, fixed-composition, token-budgeted batches. Each batch draws from ONE length
     bucket and has a fixed (B, n_lab, n_unlab) for that bucket, arranged [labelled..., unlabelled...].
@@ -275,7 +244,7 @@ class BucketedLengthSampler(torch.utils.data.Sampler):
     memory (and the long bucket stays memory-safe). Labelled dataset indices are [0, n_sp_target);
     unlabelled are [n_sp_target, n_total). `lengths` is the dataset's per-item length array."""
     def __init__(self, lengths, n_sp_target, buckets, token_budget, p_swissprot,
-                 rank=0, world=1, seed=0, filip_min=2):
+                 rank=0, world=1, seed=0, min_labelled=2):
         self.rank, self.world, self.seed, self.epoch = rank, world, seed, 0
         buckets = list(buckets)
         lengths = np.asarray(lengths)
@@ -295,7 +264,9 @@ class BucketedLengthSampler(torch.utils.data.Sampler):
             elif len(un_pool) == 0:
                 n_lab, n_unlab = B, 0
             else:
-                n_lab = min(len(lab_pool), max(filip_min, round(B * p_swissprot)))
+                # min_labelled is a floor so no bucket's batches are effectively all-unlabelled and
+                # the text pathway goes cold on that shape.
+                n_lab = min(len(lab_pool), max(min_labelled, round(B * p_swissprot)))
                 n_lab = min(n_lab, B - 1)                          # leave >=1 unlabelled slot
                 n_unlab = B - n_lab
             nb_lab = (len(lab_pool) // n_lab) if n_lab else (1 << 60)
@@ -321,7 +292,12 @@ class BucketedLengthSampler(torch.utils.data.Sampler):
         batch_ids = np.concatenate([np.arange(p["n_batches"], dtype=np.int32) for p in self.plan])
         sh = rng.permutation(len(bucket_ids))                        # interleave buckets, shuffle order
         bucket_ids, batch_ids = bucket_ids[sh], batch_ids[sh]
-        for k in range(self.rank, len(bucket_ids), self.world):
+        # Truncate to a whole number of per-rank batches so EVERY rank yields exactly __len__ batches
+        # and therefore reaches the epoch boundary (and set_epoch) on the same global step. Ranks that
+        # ran one batch long used to advance to the next epoch seed early, which breaks the "same rng
+        # on every rank -> disjoint partition" invariant this sampler depends on.
+        n_full = (len(bucket_ids) // self.world) * self.world
+        for k in range(self.rank, n_full, self.world):
             bi, i = int(bucket_ids[k]), int(batch_ids[k])
             p = self.plan[bi]
             lp, up = perms[bi]
@@ -338,6 +314,7 @@ class BucketedLengthSampler(torch.utils.data.Sampler):
 
 def make_collate(embedder, cfg_model, buckets, max_text_tokens):
     pad = cfg_model.pad_token_id
+    vocab = cfg_model.vocab_size
     buckets = list(buckets)
 
     def collate(samples):
@@ -348,6 +325,16 @@ def make_collate(embedder, cfg_model, buckets, max_text_tokens):
         for i, s in enumerate(samples):
             ids = s["ids"][:L]
             tokens[i, :len(ids)] = torch.tensor(ids)
+        # Bounds check on the HOST, where it costs ~10us and raises a readable error. nn.Embedding and
+        # cross_entropy do NOT bounds-check on XPU: an id outside [0, vocab) there is an unchecked
+        # out-of-range read that surfaces as an opaque "Segmentation fault from GPU ... NotPresent"
+        # abort with no line number. A corrupt/truncated shard .bin is the realistic way to get one.
+        lo, hi = int(tokens.min()), int(tokens.max())
+        if lo < 0 or hi >= vocab:
+            bad = [(i, int(tokens[i].min()), int(tokens[i].max())) for i in range(B)
+                   if int(tokens[i].min()) < 0 or int(tokens[i].max()) >= vocab]
+            raise ValueError(f"token id out of range [0,{vocab}): batch min={lo} max={hi}; "
+                             f"offending rows (idx, min, max)={bad[:8]}. Check the shard .bin/.idx pair.")
         labelled = torch.tensor([s["labelled"] for s in samples])
         text_emb, text_keep = embedder.encode_samples(samples)           # (B, Tb, H), (B, Tb)
         Tb = text_emb.shape[1]                                           # pad/trim text to FIXED length
