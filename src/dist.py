@@ -193,44 +193,60 @@ def broadcast_checkpoint_bytes(path, device, src: int = 0):
     return buf.to("cpu").numpy().tobytes()
 
 
-_GRAD_BUF = None        # persistent coalescing buffer for average_gradients (see below)
+_GRAD_BUFS: dict = {}   # (dtype, device) -> persistent coalescing buffer for average_gradients
 
 
 def average_gradients(model):
-    """Manual all-reduce of grads coalesced into one collective (mini-embed convention).
+    """Manual all-reduce of grads, coalesced into one collective per dtype (mini-embed convention).
     Safe here because the param-grad set is identical across ranks every step: the conditioning
     pathway always fires via the learned null token, so no param is ever conditionally unused.
 
-    The coalescing buffer is allocated ONCE and reused. The previous version built it per step with
+    MIXED DTYPES ARE NORMAL. ipex.optimize(dtype=bfloat16) casts Linear weights to bf16 but leaves
+    norms, gates and other small parameters in fp32 on purpose (numerical stability), so the grad
+    set is genuinely bf16 + fp32. Grads are therefore grouped by dtype and reduced group by group.
+    Grouping follows model.parameters() order, which is identical on every rank, so the sequence of
+    collectives matches across ranks.
+
+    Reductions below fp32 are done IN fp32: summing 192 bf16 values in bf16 (8-bit mantissa) loses
+    a large fraction of the gradient's precision, and the extra bandwidth is cheap at this size.
+    The buffer is upcast on the way in and downcast on the way out by copy_.
+
+    Each buffer is allocated ONCE and reused. The previous version built one per step with
     _flatten_dense_tensors and dropped it on return, so a ~100MB block was freed back to the caching
     allocator the instant the collective was enqueued. oneCCL runs the collective on its own queue,
     so the allocator could hand that block to the next compute kernel while CCL was still reading it
-    -- a use-after-free that shows up as an intermittent, rank-local GPU page fault. Reusing one
-    buffer removes both the hazard and ~100MB of alloc/free churn (and fragmentation) per step.
+    -- a use-after-free that shows up as an intermittent, rank-local GPU page fault. Reusing the
+    buffers removes both the hazard and the per-step alloc/free churn (and fragmentation).
     """
-    global _GRAD_BUF
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return
     world = torch.distributed.get_world_size()
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     if not grads:
         return
-    dtype, device = grads[0].dtype, grads[0].device
-    if any(g.dtype != dtype or g.device != device for g in grads):
-        raise RuntimeError("average_gradients needs one dtype/device for all grads; got "
-                           f"{sorted({str(g.dtype) for g in grads})} on "
+    device = grads[0].device
+    if any(g.device != device for g in grads):
+        raise RuntimeError("average_gradients needs all grads on one device; got "
                            f"{sorted({str(g.device) for g in grads})}")
-    n = sum(g.numel() for g in grads)
-    if _GRAD_BUF is None or _GRAD_BUF.numel() != n or _GRAD_BUF.dtype != dtype or _GRAD_BUF.device != device:
-        _GRAD_BUF = torch.empty(n, dtype=dtype, device=device)
 
-    off = 0
+    by_dtype: dict = {}                                        # insertion-ordered, same on every rank
     for g in grads:
-        _GRAD_BUF[off:off + g.numel()].copy_(g.reshape(-1))
-        off += g.numel()
-    torch.distributed.all_reduce(_GRAD_BUF, op=torch.distributed.ReduceOp.SUM)
-    _GRAD_BUF /= world
-    off = 0
-    for g in grads:
-        g.copy_(_GRAD_BUF[off:off + g.numel()].view_as(g))
-        off += g.numel()
+        by_dtype.setdefault(g.dtype, []).append(g)
+
+    for dtype, group in by_dtype.items():
+        red_dtype = torch.float32 if dtype in (torch.bfloat16, torch.float16) else dtype
+        n = sum(g.numel() for g in group)
+        buf = _GRAD_BUFS.get((dtype, device))
+        if buf is None or buf.numel() != n:
+            buf = torch.empty(n, dtype=red_dtype, device=device)
+            _GRAD_BUFS[(dtype, device)] = buf
+        off = 0
+        for g in group:
+            buf[off:off + g.numel()].copy_(g.reshape(-1))      # upcasts bf16 -> fp32
+            off += g.numel()
+        torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+        buf /= world
+        off = 0
+        for g in group:
+            g.copy_(buf[off:off + g.numel()].view_as(g))       # downcasts back to the grad dtype
+            off += g.numel()

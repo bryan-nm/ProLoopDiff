@@ -43,6 +43,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 
 # --------------------------------------------------------------------------------------
@@ -74,6 +75,11 @@ class Config:
     rope_base: float = 10000.0
     dropout: float = 0.0
     tie_embeddings: bool = True
+    # Recompute each recurrence pass during backward instead of storing its activations. The middle
+    # stack is re-entered n_recurrence times, so a pass is a natural checkpoint boundary. Costs one
+    # extra forward of the middle stack (~+25% forward FLOPs at N=3); saves most of the middle-stack
+    # activations, which dominate peak HBM. Training-only; ignored under eval/no_grad.
+    grad_checkpoint: bool = True
 
 
 # --------------------------------------------------------------------------------------
@@ -377,10 +383,27 @@ class RecurrentOADM(nn.Module):
             x = l(x, keep_mask)
         h_up = x                                                # upstream output for re-injection
 
-        for _ in range(N):
-            x = x + torch.tanh(self.reinject_gate) * h_up       # gated re-injection each pass
+        def _pass(x_in, h, te_, keep_, gen_keep_):
+            x_ = x_in + torch.tanh(self.reinject_gate) * h      # gated re-injection each pass
             for l in self.mid_layers:
-                x = l(x, keep_mask, te, gen_keep)
+                x_ = l(x_, keep_, te_, gen_keep_)
+            return x_
+
+        # use_reentrant=False is required, not stylistic. The reentrant implementation only returns
+        # gradients for tensor arguments that require grad; module parameters and any closed-over
+        # tensors silently get none. The non-reentrant path builds the real autograd graph in the
+        # forward and only defers the *saved tensors*, so every parameter is differentiated normally.
+        # h_up is passed as an argument rather than captured for the same belt-and-braces reason.
+        # preserve_rng_state costs a device RNG save/restore per checkpoint and is only needed if the
+        # recomputed region is stochastic; at dropout=0 it is not.
+        ckpt = cfg.grad_checkpoint and self.training and torch.is_grad_enabled()
+        for _ in range(N):
+            if ckpt:
+                x = torch.utils.checkpoint.checkpoint(
+                    _pass, x, h_up, te, keep_mask, gen_keep,
+                    use_reentrant=False, preserve_rng_state=(cfg.dropout > 0))
+            else:
+                x = _pass(x, h_up, te, keep_mask, gen_keep)
 
         for l in self.down_layers:
             x = l(x, keep_mask)

@@ -145,17 +145,22 @@ def main():
     ap.add_argument("--no-ipex", action="store_true", help="skip ipex.optimize (eager XPU; robust to dynamic shapes)")
     ap.add_argument("--eval-every", type=int, default=None,
                     help="override opt.eval_every for the sampling eval (0 disables it)")
+    ap.add_argument("--no-grad-checkpoint", action="store_true",
+                    help="disable recurrence-loop gradient checkpointing (more HBM, ~25%% less fwd compute)")
     args = ap.parse_args()
 
     env = init_distributed(args.device)
     dev = env.device
     torch.manual_seed(CFG.opt.seed + env.rank)
     mcfg, dcfg, ocfg = CFG.model_config(), CFG.data, CFG.opt
+    if args.no_grad_checkpoint:
+        mcfg.grad_checkpoint = False
 
     # --- model ---
     model = RecurrentOADM(mcfg).to(dev)
     if env.is_main:
-        print(f"[train] params={count_params(model)/1e6:.1f}M device={dev}", flush=True)
+        print(f"[train] params={count_params(model)/1e6:.1f}M device={dev} "
+              f"grad_checkpoint={mcfg.grad_checkpoint}", flush=True)
     broadcast_parameters(model)
     sub_probs = blosum_sub_probs(BLOSUM_MAT, temp=ocfg.blosum_temp).to(dev) \
         if os.path.exists(BLOSUM_MAT) else None
