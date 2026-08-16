@@ -10,6 +10,7 @@ Launch (Aurora): via train.pbs (mpiexec, one rank per tile). Local smoke:
 from __future__ import annotations
 import io
 import os
+import sys
 import math
 import time
 import argparse
@@ -17,7 +18,7 @@ import torch
 
 from config import CFG, SWISSPROT_CSV, UNANNOTATED_SHARDS, TEXT_ENCODER, TEXT_CACHE, BLOSUM_MAT, CKPT_DIR
 from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
-                   any_rank, broadcast_checkpoint_bytes)
+                   broadcast_checkpoint_bytes)
 from .recurrent_oadm import RecurrentOADM, count_params
 from .objective import training_step
 from .sampler import generate
@@ -147,6 +148,12 @@ def main():
                     help="override opt.eval_every for the sampling eval (0 disables it)")
     ap.add_argument("--no-grad-checkpoint", action="store_true",
                     help="disable recurrence-loop gradient checkpointing (more HBM, ~25%% less fwd compute)")
+    ap.add_argument("--sync-stages", type=int, default=0, metavar="N",
+                    help="diagnostic: device-sync and print the stage after each phase of the first N "
+                         "steps, from EVERY rank. A GPU page fault aborts the process with no Python "
+                         "traceback, so the last [stage] line a rank printed names the faulting phase. "
+                         "Grep the .o log for the rank in the abort message. Costs throughput; the "
+                         "syncs also serialise the step, so do not read tok/s from such a run.")
     args = ap.parse_args()
 
     env = init_distributed(args.device)
@@ -254,42 +261,54 @@ def main():
     skipped, skip_streak = 0, 0                                # non-finite-gradient updates dropped
     t_start, t_eval_total = time.perf_counter(), 0.0           # for the measured eval-overhead figure
     model.train()
+
+    def stage(name, shape):
+        """Diagnostic breadcrumb: see --sync-stages."""
+        if step - start_step < args.sync_stages:
+            _device_sync(dev)
+            print(f"[stage] rank {env.rank} step {step} {name} shape={shape}", file=sys.stderr, flush=True)
     while step < total:
         sampler.set_epoch(step)
         for batch in loader:
             batch = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            shape = tuple(batch["tokens"].shape)
             n_tok = batch["tokens"].numel()                    # canvas tokens processed this step (B*L)
+            stage("h2d", shape)
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
                 loss, m = training_step(model, batch, p_uncond=ocfg.p_uncond,
                                         beta=ocfg.beta, sub_probs=sub_probs, beta_schedule=ocfg.beta_schedule,
                                         pad_loss_weight=ocfg.pad_loss_weight)
+            stage("forward", shape)
             loss.backward()
+            stage("backward", shape)
             # Average BEFORE clipping: clipping first clips each rank's local gradient to grad_clip and
             # then averages, which is not global-norm clipping and biases the step toward the ranks with
-            # the smallest gradients. Order matters at 192 ranks.
-            average_gradients(model)
-            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), ocfg.grad_clip)
-            # A non-finite norm makes clip_grad_norm_'s coefficient NaN, so opt.step() would turn
-            # EVERY parameter NaN -- the run then burns node-hours on garbage and writes poisoned
-            # checkpoints. Skip the update instead (next iteration's zero_grad discards the bad
-            # grads; params and AdamW moments are untouched). Gradients are already all-reduced, so
-            # a NaN on any rank has reached all of them; any_rank() makes the decision unanimous by
-            # construction for one small collective, since a split decision would deadlock the job.
-            if any_rank(~torch.isfinite(total_norm), dev):
+            # the smallest gradients. Order matters at 192 ranks. The reduction also reports whether any
+            # rank produced a non-finite gradient, in-band, so no second collective is needed.
+            nonfinite = average_gradients(model)
+            stage("allreduce", shape)
+            # A NaN/Inf gradient makes clip_grad_norm_'s coefficient NaN, so opt.step() would turn EVERY
+            # parameter NaN -- the run then burns node-hours on garbage and writes poisoned checkpoints.
+            # Skip the update instead; the next iteration's zero_grad discards the bad grads, and params
+            # and AdamW moments are untouched. Every rank read the same reduced flag, so the decision is
+            # unanimous and no rank can diverge into a hang.
+            if nonfinite:
                 skipped += 1
                 skip_streak += 1
                 if env.is_main:
-                    print(f"[warn] step {step}: non-finite grad norm -> update skipped "
+                    print(f"[warn] step {step}: non-finite gradient -> update skipped "
                           f"({skip_streak} consecutive, {skipped} total)", flush=True)
                 if skip_streak >= ocfg.max_skip_streak:
                     raise RuntimeError(
-                        f"{skip_streak} consecutive non-finite gradient norms ending at step {step}; "
+                        f"{skip_streak} consecutive non-finite gradients ending at step {step}; "
                         f"aborting rather than spinning. Last good checkpoint is in {CKPT_DIR}.")
             else:
                 skip_streak = 0
+                torch.nn.utils.clip_grad_norm_(model.parameters(), ocfg.grad_clip)
                 opt.step()
             sched.step()                                       # always: LR stays a function of `step`
+            stage("step", shape)
             tok_win += n_tok
             steps_win += 1
             if env.is_main and step % log_every == 0:

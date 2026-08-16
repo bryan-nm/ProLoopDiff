@@ -133,30 +133,6 @@ def broadcast_parameters(model, src: int = 0):
             torch.distributed.broadcast(p.data, src=src)
 
 
-_FLAG_BUF = None        # persistent 1-element buffer for any_rank
-
-
-def any_rank(flag, device) -> bool:
-    """OR a per-rank flag across the world and return it on the host.
-
-    `flag` is a Python bool or any 0-d/1-element tensor (nonzero = True). Costs one tiny collective
-    and exactly ONE device->host sync, so the caller can make a control-flow decision (skip a step,
-    abort) that is guaranteed unanimous. Ranks that disagreed about whether to run a collective would
-    deadlock until the walltime, which is why this is a guarantee and not an argument.
-    """
-    global _FLAG_BUF
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return bool(flag) if isinstance(flag, bool) else bool(flag.reshape(-1)[0].item())
-    if _FLAG_BUF is None or _FLAG_BUF.device != device:
-        _FLAG_BUF = torch.zeros(1, dtype=torch.float32, device=device)
-    if isinstance(flag, bool):
-        _FLAG_BUF.fill_(1.0 if flag else 0.0)
-    else:
-        _FLAG_BUF.copy_(flag.reshape(-1)[:1].float())          # stays on device; no sync yet
-    torch.distributed.all_reduce(_FLAG_BUF, op=torch.distributed.ReduceOp.MAX)
-    return bool(_FLAG_BUF.item() > 0)                          # the one sync
-
-
 def broadcast_checkpoint_bytes(path, device, src: int = 0):
     """Rank `src` reads `path` and broadcasts the raw bytes; every rank returns identical bytes
     (or None if `path` is None on `src`, i.e. there is no checkpoint to resume).
@@ -193,60 +169,64 @@ def broadcast_checkpoint_bytes(path, device, src: int = 0):
     return buf.to("cpu").numpy().tobytes()
 
 
-_GRAD_BUFS: dict = {}   # (dtype, device) -> persistent coalescing buffer for average_gradients
+_GRAD_BUF = None        # persistent [n_grad_elems + 1] fp32 buffer: coalesced grads, then a flag
 
 
-def average_gradients(model):
-    """Manual all-reduce of grads, coalesced into one collective per dtype (mini-embed convention).
+def average_gradients(model) -> bool:
+    """All-reduce the gradients. Returns True if ANY rank produced a non-finite gradient this step.
+
     Safe here because the param-grad set is identical across ranks every step: the conditioning
     pathway always fires via the learned null token, so no param is ever conditionally unused.
 
-    MIXED DTYPES ARE NORMAL. ipex.optimize(dtype=bfloat16) casts Linear weights to bf16 but leaves
-    norms, gates and other small parameters in fp32 on purpose (numerical stability), so the grad
-    set is genuinely bf16 + fp32. Grads are therefore grouped by dtype and reduced group by group.
-    Grouping follows model.parameters() order, which is identical on every rank, so the sequence of
-    collectives matches across ranks.
+    ONE COLLECTIVE PER STEP, and that is deliberate. Every grad goes into a single fp32 buffer
+    regardless of its own dtype, and the non-finite flag rides in the buffer's last element rather
+    than taking an all-reduce of its own. At 192 ranks over 16 nodes each additional collective is
+    another size-dependent algorithm path inside oneCCL, and small-message paths differ from
+    large-message ones; a single large fp32 all-reduce is the shape this job is known to sustain.
+    Carrying the flag in-band also makes the skip decision unanimous for free -- every rank reads
+    the same reduced element -- with no second collective to keep in sync.
 
-    Reductions below fp32 are done IN fp32: summing 192 bf16 values in bf16 (8-bit mantissa) loses
-    a large fraction of the gradient's precision, and the extra bandwidth is cheap at this size.
-    The buffer is upcast on the way in and downcast on the way out by copy_.
+    MIXED GRAD DTYPES ARE NORMAL: ipex.optimize(dtype=bfloat16) casts Linear weights to bf16 but
+    deliberately leaves norms, gates and other small parameters in fp32. copy_ upcasts on the way
+    in and downcasts on the way out. Reducing in fp32 matters on its own -- accumulating 192 bf16
+    values loses ~8% of the value to the 8-bit mantissa.
 
-    Each buffer is allocated ONCE and reused. The previous version built one per step with
-    _flatten_dense_tensors and dropped it on return, so a ~100MB block was freed back to the caching
-    allocator the instant the collective was enqueued. oneCCL runs the collective on its own queue,
-    so the allocator could hand that block to the next compute kernel while CCL was still reading it
-    -- a use-after-free that shows up as an intermittent, rank-local GPU page fault. Reusing the
-    buffers removes both the hazard and the per-step alloc/free churn (and fragmentation).
+    The buffer is allocated ONCE and reused. Building it per step (the original
+    _flatten_dense_tensors version) freed a ~220MB block back to the caching allocator the instant
+    the collective was enqueued; oneCCL runs on its own queue, so the allocator could hand that
+    block to the next compute kernel while CCL was still reading it -- a use-after-free that
+    surfaces as an intermittent, rank-local GPU page fault.
     """
+    global _GRAD_BUF
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return
+        return False
     world = torch.distributed.get_world_size()
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     if not grads:
-        return
+        return False
     device = grads[0].device
     if any(g.device != device for g in grads):
         raise RuntimeError("average_gradients needs all grads on one device; got "
                            f"{sorted({str(g.device) for g in grads})}")
 
-    by_dtype: dict = {}                                        # insertion-ordered, same on every rank
-    for g in grads:
-        by_dtype.setdefault(g.dtype, []).append(g)
+    n = sum(g.numel() for g in grads)
+    if _GRAD_BUF is None or _GRAD_BUF.numel() != n + 1 or _GRAD_BUF.device != device:
+        _GRAD_BUF = torch.empty(n + 1, dtype=torch.float32, device=device)
+    flat = _GRAD_BUF[:n]
 
-    for dtype, group in by_dtype.items():
-        red_dtype = torch.float32 if dtype in (torch.bfloat16, torch.float16) else dtype
-        n = sum(g.numel() for g in group)
-        buf = _GRAD_BUFS.get((dtype, device))
-        if buf is None or buf.numel() != n:
-            buf = torch.empty(n, dtype=red_dtype, device=device)
-            _GRAD_BUFS[(dtype, device)] = buf
-        off = 0
-        for g in group:
-            buf[off:off + g.numel()].copy_(g.reshape(-1))      # upcasts bf16 -> fp32
-            off += g.numel()
-        torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
-        buf /= world
-        off = 0
-        for g in group:
-            g.copy_(buf[off:off + g.numel()].view_as(g))       # downcasts back to the grad dtype
-            off += g.numel()
+    off = 0
+    for g in grads:
+        flat[off:off + g.numel()].copy_(g.reshape(-1))         # upcasts bf16 -> fp32
+        off += g.numel()
+    _GRAD_BUF[n] = (~torch.isfinite(flat).all()).float()       # in-band flag, stays on device
+
+    torch.distributed.all_reduce(_GRAD_BUF, op=torch.distributed.ReduceOp.SUM)
+
+    if bool(_GRAD_BUF[n].item() > 0):                          # the one host sync
+        return True                                            # caller skips; don't write back garbage
+    flat /= world
+    off = 0
+    for g in grads:
+        g.copy_(flat[off:off + g.numel()].view_as(g))          # downcasts back to the grad dtype
+        off += g.numel()
+    return False
