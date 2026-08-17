@@ -355,6 +355,13 @@ class RecurrentOADM(nn.Module):
         cm = cond_mask.view(B, 1)
         te = torch.cat([null, text_emb], dim=1)                       # (B, 1+T, text_dim)
         keep = torch.cat([~cm, text_keep & cm], dim=1)                # (B, 1+T)
+        # A conditioned row whose text has NO real tokens would leave this row of the cross-attention
+        # mask entirely False -- a softmax over an empty set. That is undefined: it yields NaN at
+        # best, and fused attention kernels that derive an index from the row max can read out of
+        # bounds. Fall back to the null slot so every row always has exactly one attendable position;
+        # rows that already had real text are untouched. Reachable via a zero-token row in the text
+        # cache (CacheTextEmbedder derives n from consecutive offsets and never checks for n == 0).
+        keep[:, 0] |= ~keep.any(dim=1)
         return te, keep
 
     def forward(self, tokens, text_emb=None, text_keep=None, cond_mask=None,
