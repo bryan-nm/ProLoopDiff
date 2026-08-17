@@ -185,6 +185,27 @@ def broadcast_checkpoint_bytes(path, device, src: int = 0):
 _GRAD_BUF = None        # persistent [n_grad_elems + 1] fp32 buffer: coalesced grads, then a flag
 
 
+def preallocate_grad_buffer(model, device) -> int:
+    """Allocate the all-reduce buffer BEFORE training touches the allocator; returns its elements.
+
+    Without this the buffer is created on the first average_gradients call, i.e. after a full forward
+    and backward have already churned the heap, so its address is whatever happens to be free then.
+    oneCCL caches L0 registrations and IPC handles keyed by pointer, so the one buffer it touches
+    every step is exactly the thing whose address should be fixed for the life of the run and taken
+    from a clean heap. Cheap insurance: ~220MB that was going to be resident anyway.
+
+    Sized from every parameter. average_gradients re-derives the size from the grads that actually
+    exist and reallocates if they disagree, so a mismatch degrades to the old behaviour rather than
+    corrupting anything.
+    """
+    global _GRAD_BUF
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return 0
+    n = sum(p.numel() for p in model.parameters())
+    _GRAD_BUF = torch.empty(n + 1, dtype=torch.float32, device=device)
+    return n
+
+
 def average_gradients(model) -> bool:
     """All-reduce the gradients. Returns True if ANY rank produced a non-finite gradient this step.
 

@@ -18,7 +18,7 @@ import torch
 
 from config import CFG, SWISSPROT_CSV, UNANNOTATED_SHARDS, TEXT_ENCODER, TEXT_CACHE, BLOSUM_MAT, CKPT_DIR
 from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
-                   broadcast_checkpoint_bytes)
+                   broadcast_checkpoint_bytes, preallocate_grad_buffer)
 from .recurrent_oadm import RecurrentOADM, count_params
 from .objective import training_step
 from .sampler import generate
@@ -149,6 +149,11 @@ def main():
     ap.add_argument("--grad-checkpoint", default=None, action=argparse.BooleanOptionalAction,
                     help="recurrence-loop gradient checkpointing (default off: see Config.grad_checkpoint "
                          "-- it currently page-faults the GPU inside backward at 16 nodes)")
+    ap.add_argument("--drain-collectives", action="store_true",
+                    help="diagnostic: barrier() after every gradient all-reduce, forcing oneCCL to "
+                         "complete before the next step allocates. NB torch.xpu.synchronize() does "
+                         "NOT do this -- it drains PyTorch's queues, not oneCCL's own. Use this to "
+                         "test whether an in-flight collective racing the allocator is the fault.")
     ap.add_argument("--sync-stages", type=int, default=0, metavar="N",
                     help="diagnostic: device-sync and print the stage after each phase of the first N "
                          "steps, from EVERY rank. A GPU page fault aborts the process with no Python "
@@ -251,6 +256,11 @@ def main():
         if env.is_main:
             print(f"[ckpt] resumed from {ckpt_path}: continuing at step {start_step}", flush=True)
 
+    # Fix the all-reduce buffer's address before the first forward churns the heap (see dist.py).
+    n_grad = preallocate_grad_buffer(model, dev)
+    if env.is_main and n_grad:
+        print(f"[train] all-reduce buffer preallocated: {4 * (n_grad + 1) / 1e6:.0f}MB fp32", flush=True)
+
     total = args.max_steps or (60 if args.smoke else ocfg.total_steps)
     log_every = 10 if args.smoke else ocfg.log_every
     # Smoke runs on CPU, so shrink the eval to something that still exercises the whole path.
@@ -288,6 +298,8 @@ def main():
             # the smallest gradients. Order matters at 192 ranks. The reduction also reports whether any
             # rank produced a non-finite gradient, in-band, so no second collective is needed.
             nonfinite = average_gradients(model)
+            if args.drain_collectives:
+                barrier()
             stage("allreduce", shape)
             # A NaN/Inf gradient makes clip_grad_norm_'s coefficient NaN, so opt.step() would turn EVERY
             # parameter NaN -- the run then burns node-hours on garbage and writes poisoned checkpoints.
