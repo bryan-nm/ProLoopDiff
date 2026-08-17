@@ -9,6 +9,14 @@ so on a run resumed at step S the epoch seed is S -- which is why a resumed job 
 sequence the original job never saw, and why a resume can fault within a few steps of a checkpoint
 the original run sailed past. Pass --epoch S and --batch (crash_step - S).
 
+MATCH THE JOB'S DEVICE ENVIRONMENT, or a clean run proves nothing. An interactive shell does NOT
+inherit what scripts/pbs_common.sh exports, and the defaults give you a different execution model:
+COMPOSITE hierarchy makes xpu:0 a whole 2-tile GPU with implicit scaling instead of the single tile
+a training rank gets. Export these first (dist.py warns if you forget):
+
+    export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+    export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+
 Example: a job resumed from ckpt_00019000 (so step 19001) faulted on rank 29 at step 19003, in
 backward, at 192 ranks. Reproduce and then bisect, in an interactive session:
 

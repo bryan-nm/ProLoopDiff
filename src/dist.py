@@ -92,10 +92,23 @@ def init_distributed(device_name: str = "auto") -> DistEnv:
     rank, world, local = _detect_topology()
     device = _pick_device(local, device_name)
 
-    # Aurora footgun: frameworks defaults ONEAPI_DEVICE_SELECTOR to opencl+level_zero, doubling the
-    # device list so ranks mis-pin and the GPU aborts. The launch script must set level_zero:gpu.
-    if device.type == "xpu" and rank == 0 and "opencl" in os.environ.get("ONEAPI_DEVICE_SELECTOR", "").lower():
-        print("[dist] WARNING: ONEAPI_DEVICE_SELECTOR exposes OpenCL+Level-Zero; set level_zero:gpu.", flush=True)
+    # Aurora footguns, both set by scripts/pbs_common.sh. An interactive session that did not source
+    # it runs a DIFFERENT execution model, which silently invalidates any attempt to reproduce a job.
+    if device.type == "xpu" and rank == 0:
+        # frameworks defaults ONEAPI_DEVICE_SELECTOR to opencl+level_zero, doubling the device list
+        # so ranks mis-pin and the GPU aborts.
+        if "opencl" in os.environ.get("ONEAPI_DEVICE_SELECTOR", "").lower():
+            print("[dist] WARNING: ONEAPI_DEVICE_SELECTOR exposes OpenCL+Level-Zero; set level_zero:gpu.",
+                  flush=True)
+        # Without FLAT, one "device" is a whole 2-tile GPU with implicit scaling across both tiles --
+        # half the device count, mis-pinned ranks, and work spread over two tiles instead of one.
+        hier = os.environ.get("ZE_FLAT_DEVICE_HIERARCHY", "")
+        if hier.upper() != "FLAT":
+            print(f"[dist] WARNING: ZE_FLAT_DEVICE_HIERARCHY={hier or '<unset>'}, want FLAT. Each device "
+                  f"is then a whole 2-tile GPU with implicit scaling, not one tile -- a repro run like "
+                  f"this does NOT match a FLAT training job.", flush=True)
+        print(f"[dist] xpu: {torch.xpu.device_count()} device(s) visible "
+              f"(expect 12 tiles/node on Aurora under FLAT), using {device}", flush=True)
 
     if world <= 1:
         return DistEnv(0, 1, 0, device, "none")
