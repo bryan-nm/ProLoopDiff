@@ -1,0 +1,214 @@
+[dist] xpu: 12 device(s) visible (expect 12 tiles/node on Aurora under FLAT), using xpu:0
+[dist] backend=xccl world=192 rank0 device=xpu:0
+[train] params=54.7M device=xpu:0 grad_checkpoint=True
+2026:08:17-21:49:25:66009 |CCL_WARN| value of CCL_KVS_MODE changed to be mpi (default:pmi)
+2026:08:17-21:49:25:66009 |CCL_WARN| value of CCL_KVS_CONNECTION_TIMEOUT changed to be 600 (default:120)
+2026:08:17-21:49:25:66009 |CCL_WARN| value of CCL_OP_SYNC changed to be 1 (default:0)
+2026:08:17-21:49:25:66009 |CCL_WARN| value of CCL_PROCESS_LAUNCHER changed to be pmix (default:hydra)
+2026-08-17 21:49:40,958 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:40,980 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:40,980 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:40,991 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:40,991 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:40,999 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,003 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,008 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,017 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,018 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,019 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,021 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,023 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,023 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,024 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,025 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,029 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,030 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,034 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,033 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,035 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,035 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,037 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,039 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,040 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,040 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,042 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,042 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,043 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,045 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,047 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,052 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,052 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,053 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,055 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,057 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,056 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,058 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,058 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,059 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,059 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,059 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,059 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,063 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,064 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,064 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,066 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,069 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,070 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,070 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,071 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,072 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,073 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,075 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,078 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,079 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,080 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,082 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,083 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,084 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,083 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,087 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,089 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,090 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,092 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,091 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,094 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,094 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,096 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,097 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,096 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,095 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,096 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,097 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,099 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,099 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,102 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,100 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,100 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,104 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,102 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,102 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,103 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,104 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,105 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,105 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,106 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,105 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,106 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,107 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,106 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,107 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,107 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,108 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,109 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,109 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,110 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,112 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,112 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,113 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,113 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,114 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,114 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,117 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,118 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,118 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,119 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,121 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,122 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,123 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,122 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,123 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,124 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,124 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,124 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,125 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,127 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,126 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,127 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,128 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,128 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,129 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,130 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,130 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,132 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,134 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,135 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,138 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,139 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,139 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,141 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,140 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,142 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,142 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,142 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,145 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,144 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,147 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,148 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,149 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,150 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,151 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,153 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,156 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,156 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,157 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,158 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,157 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,162 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,160 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+[train] swissprot=451436 unannotated=96182888 mixed=128243851 text=cache tok_budget=32768 batches/epoch/rank=6210
+[train] buckets: L128:B256(64L+192U)x91870  L256:B128(32L+96U)x339907  L384:B85(21L+64U)x426354  L512:B64(16L+48U)x334294
+2026-08-17 21:49:41,162 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,162 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,167 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,171 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,177 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,182 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,183 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,185 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,185 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,187 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,189 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,194 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,200 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,203 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+[train] ipex.optimize ON (device=xpu, requested=True, ipex=available)
+2026-08-17 21:49:41,204 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,210 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,213 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,215 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,226 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,230 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,257 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,266 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,293 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,314 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,327 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,365 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,369 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,372 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,377 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,397 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,408 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,409 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,424 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,512 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,513 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,692 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:41,880 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:42,026 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:42,085 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:42,155 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:42,161 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+2026-08-17 21:49:42,185 - _logger.py - IPEX - INFO - Currently split master weight for xpu only support sgd
+[ckpt] resumed from /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/gc_ladder.8762688.aurora-pbs-0001.hostmgmt.cm.aurora.alcf.anl.gov/ckpt/ckpt_00019000.pt: continuing at step 19001
+[train] all-reduce buffer preallocated: 219MB fp32
+Segmentation fault from GPU at 0xff03fffff0e00000, ctx_id: 5 (CCS) type: 0 (NotPresent), level: 0 (PTE), access: 0 (Read), banned: 1, aborting.
+Abort was called at 288 line in file:
+/home/ubit/rpmbuild/BUILD/intel-compute-runtime-25.18.33578.42/shared/source/os_interface/linux/drm_neo.cpp
+Segmentation fault from GPU at 0xff03fffff0e00000, ctx_id: 5 (CCS) type: 0 (NotPresent), level: 0 (PTE), access: 0 (Read), banned: 1, aborting.
+Segmentation fault from GPU at 0xff01fffff0e00000, ctx_id: 5 (CCS) type: 0 (NotPresent), level: 0 (PTE), access: 0 (Read), banned: 1, aborting.
+Abort was called at 288 line in file:
+/home/ubit/rpmbuild/BUILD/intel-compute-runtime-25.18.33578.42/shared/source/os_interface/linux/drm_neo.cpp
+Segmentation fault from GPU at 0xff01fffff0e00000, ctx_id: 5 (CCS) type: 0 (NotPresent), level: 0 (PTE), access: 0 (Read), banned: 1, aborting.
+x4407c3s6b0n0.hsn.cm.aurora.alcf.anl.gov: rank 99 died from signal 6
+x4305c1s3b0n0.hsn.cm.aurora.alcf.anl.gov: rank 19 died from signal 15

@@ -96,16 +96,57 @@ run_rung() {
 }
 
 # --- the ladder -------------------------------------------------------------------------------
+# Every knob below is copied from this build's own `CCL_LOG_LEVEL=info` dump, with its default noted.
+# The first version of this ladder guessed names and values: CCL_ZE_CACHE=0 segfaulted oneCCL before
+# step 0, CCL_ZE_IPC_EXCHANGE=drmfd is not a legal value (only sockets|pidfd), CCL_ZE_ENABLE=0 broke
+# comm creation outright, and PYTORCH_XPU_ALLOC_CONF was silently ignored. Five of six rungs ran no
+# experiment at all, so validate_rung() below now REFUSES to score a rung whose knob did not take.
+#
 # name | env overrides | extra train.py args
 RUNGS=(
+  # Control. Must fault, or the harness is not reproducing and nothing below means anything.
   "R0-reproduce||--grad-checkpoint"
-  "R1-drain-collectives||--grad-checkpoint --drain-collectives"
-  "R2-ze-cache-off|CCL_ZE_CACHE=0|--grad-checkpoint"
-  "R3-ipc-drmfd|CCL_ZE_IPC_EXCHANGE=drmfd|--grad-checkpoint"
-  "R4-ze-disabled|CCL_ZE_ENABLE=0|--grad-checkpoint"
-  "R5-expandable-on|PYTORCH_XPU_ALLOC_CONF=expandable_segments:True|--grad-checkpoint"
-  "R6-expandable-off|PYTORCH_XPU_ALLOC_CONF=expandable_segments:False|--grad-checkpoint"
+  # The hypothesis, targeted precisely: oneCCL caches opened/exported Level-Zero IPC handles
+  # (both default 1). A cached mapping into a peer buffer going stale after that peer's allocator
+  # recycles the block is exactly a read of a NotPresent page.
+  "R1-no-ipc-handle-cache|CCL_ZE_CACHE_OPEN_IPC_HANDLES=0 CCL_ZE_CACHE_GET_IPC_HANDLES=0|--grad-checkpoint"
+  # Same idea one level up: oneCCL's own device memory cache (policy chunk, 800MB ceiling).
+  "R2-no-device-cache|CCL_ZE_DEVICE_CACHE_UPPER_LIMIT=0|--grad-checkpoint"
+  # Enable the vendor's own IPC workaround flags (both default 0 -- they exist for a reason).
+  "R3-ipc-workarounds|CCL_ZE_CLOSE_IPC_WA=1 CCL_KERNEL_1S_IPC_WA=1|--grad-checkpoint"
+  # Take the topology-aware path out entirely. This is the knob CCL_ZE_ENABLE=0 was meant to be.
+  "R4-no-topo-algo|CCL_TOPO_ALGO=0|--grad-checkpoint"
+  # The only other legal IPC exchange mechanism on this build.
+  "R5-ipc-sockets|CCL_ZE_IPC_EXCHANGE=sockets|--grad-checkpoint"
+  # Different collective implementation for the single-node leg.
+  "R6-no-sycl-single-node|CCL_SYCL_SINGLE_NODE_ALGORITHM=0|--grad-checkpoint"
+  # Stop registering/caching pointers (default threshold 4GB, so our 219MB buffer is registered).
+  "R7-no-ptr-register|CCL_ZE_PTR_REGISTER_THRESHOLD=0|--grad-checkpoint"
 )
+
+# A rung is only evidence if its knob actually took effect. oneCCL prints
+#   |CCL_WARN| value of CCL_FOO changed to be X (default:Y)
+# for every CCL_* it accepts at a non-default value, and raises "unexpected value" for ones it
+# rejects; a name it does not know produces neither. Anything that never reached the training loop,
+# or died some way other than the GPU page fault we are chasing, is not a data point either.
+# Echoes the reason on stdout; returns non-zero if the rung must be scored INVALID.
+validate_rung() {
+    local envs="$1" log="$2" kv var
+    grep -q "unexpected value" "$log" && {
+        echo "oneCCL REJECTED the value: $(grep -m1 -o 'unexpected value.*' "$log" | cut -c1-110)"; return 1; }
+    for kv in $envs; do
+        var="${kv%%=*}"
+        case "$var" in
+            CCL_*) grep -q "value of ${var} changed" "$log" || {
+                       echo "${var} was silently IGNORED (no oneCCL ack; wrong name for this build?)"
+                       return 1; } ;;
+            *)     echo "NOTE: ${var} cannot be verified from the log -- treat this rung as unproven" ;;
+        esac
+    done
+    grep -q "all-reduce buffer preallocated" "$log" || {
+        echo "never reached the training loop (init crash, not our fault)"; return 1; }
+    return 0
+}
 
 # Optional first pass purely to record which allreduce algorithm oneCCL selects, so the rungs below
 # are not guesswork about which code path is even in play. Expected to fault; we only want the log.
@@ -125,11 +166,12 @@ fi
 declare -a RESULTS
 WINNER=""
 SKIPPED=0
+INVALID=0
 for entry in "${RUNGS[@]}"; do
     IFS='|' read -r name envs extra <<< "$entry"
     left=$(( DEADLINE - $(date +%s) ))
     if [ "$left" -lt "$RESERVE" ]; then
-        RESULTS+=("$(printf '%-22s SKIPPED  (only %ds left)' "$name" "$left")")
+        RESULTS+=("$(printf '%-24s SKIPPED  (only %ds left)' "$name" "$left")")
         SKIPPED=$(( SKIPPED + 1 ))
         continue
     fi
@@ -144,18 +186,30 @@ for entry in "${RUNGS[@]}"; do
     # Trust the trainer's own completion line, not the exit code: an aborting rank makes mpiexec
     # report 143 via SIGTERM cleanup, which is indistinguishable from other failures by code alone.
     if grep -q "\[train\] done at step" "$log"; then
-        RESULTS+=("$(printf '%-22s SURVIVED %d steps in %ds' "$name" "$PASS_STEPS" "$dt")")
+        RESULTS+=("$(printf '%-24s SURVIVED %d steps in %ds' "$name" "$PASS_STEPS" "$dt")")
         WINNER="$name"
         echo "  -> SURVIVED. Stopping the ladder."
         tail -4 "$log" | sed 's/^/    /'
         break
     fi
 
+    # Scored INVALID rather than FAULTED when the knob never took: an unrun rung is not evidence
+    # that the knob does not help, and conflating the two is how the first ladder wasted an hour.
+    if ! reason=$(validate_rung "$envs" "$log"); then
+        RESULTS+=("$(printf '%-24s INVALID  %s' "$name" "$reason")")
+        INVALID=$(( INVALID + 1 ))
+        echo "  -> INVALID: ${reason}"
+        echo "     (rung ran no experiment; fix the knob and rerun it)"
+        sleep "$SETTLE"
+        continue
+    fi
+    [ -n "$reason" ] && echo "  $reason"
+
     if grep -q "Segmentation fault from GPU" "$log"; then why="GPU page fault"
     elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then why="hit the ${RUNG_WALL}s rung wall (hang?)"
-    else why="failed rc=$rc"; fi
+    else why="failed rc=$rc (NOT the GPU page fault -- check the log)"; fi
     reached=$(grep -oE "^step +[0-9]+" "$log" | tail -1 | tr -s ' ')
-    RESULTS+=("$(printf '%-22s FAULTED  %s in %ds (last %s)' "$name" "$why" "$dt" "${reached:-no step logged}")")
+    RESULTS+=("$(printf '%-24s FAULTED  %s in %ds (last %s)' "$name" "$why" "$dt" "${reached:-before first log}")")
     echo "  -> ${why}. Escalating."
     grep -E "Segmentation fault from GPU|died from signal" "$log" | head -3 | sed 's/^/    /'
     # A faulted rung leaves its GPU contexts banned ("banned: 1"); give PALS a moment to reap the
@@ -186,9 +240,13 @@ elif [ "$SKIPPED" -gt 0 ]; then
     echo "     answer may still be in a rung below. Resubmit with the faulted rungs deleted from"
     echo "     RUNGS, or with a lower PASS_STEPS. Startup (CSV parse + 96M-sequence shard index +"
     echo "     checkpoint broadcast) is a few minutes per rung and dominates the budget."
+elif [ "$INVALID" -gt 0 ]; then
+    echo
+    echo "  => ${INVALID} rung(s) were INVALID: their knob never took effect, so they cleared nothing."
+    echo "     Fix those knob names/values against ${LADDER_DIR}/ccl-info.log and rerun just those."
 else
     echo
-    echo "  => every rung faulted. The fault is in none of these knobs; next steps:"
+    echo "  => every rung faulted with its knob verified in effect. The fault is in none of them:"
     echo "     - read ${LADDER_DIR}/ccl-info.log for the selected algorithm, then target that path"
     echo "     - try combinations (this ladder is deliberately single-variable)"
     echo "     - file with ALCF support: 16 nodes, --grad-checkpoint as the single toggle,"

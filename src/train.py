@@ -137,6 +137,33 @@ def eval_sample_lengths(model, dev, n, canvas, steps, seed=1234):
     return lens.mean().item(), lens.std().item(), int((lens >= canvas).sum())
 
 
+def dump_mem_segments(dev, rank, step):
+    """Print the caching allocator's segment address ranges for this rank.
+
+    Why this matters: the GPU fault address has been IDENTICAL across every run so far -- three
+    values whose low 44 bits all read 0xfffff0e00000, differing only in the byte that encodes the
+    tile. That is one specific allocation, not a race on random memory. So the question collapses to
+    a single bit: does that address fall INSIDE a PyTorch segment?
+
+      inside  -> the memory is PyTorch's, and something outside PyTorch (oneCCL, through a cached
+                 IPC handle) is reading it after the allocator recycled or released it. Fix belongs
+                 in how we hand buffers to the collective.
+      outside -> the memory is oneCCL's own (its device cache is 800MB, its scaleout buffer 1GB),
+                 and our allocator churn is only the trigger. Fix belongs in the CCL configuration.
+
+    Grep the job log for the fault address against these ranges.
+    """
+    snap = getattr(torch.xpu, "memory_snapshot", None) if dev.type == "xpu" else None
+    if snap is None:
+        print(f"[mem] rank {rank}: no memory_snapshot on this device type", file=sys.stderr, flush=True)
+        return
+    for s in snap():
+        addr, size = s.get("address"), s.get("total_size", 0)
+        if addr is not None:
+            print(f"[mem] rank {rank} step {step} seg 0x{addr:012x}-0x{addr + size:012x} "
+                  f"size {size} {s.get('segment_type', '?')}", file=sys.stderr, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default=CFG.device)
@@ -154,6 +181,11 @@ def main():
                          "complete before the next step allocates. NB torch.xpu.synchronize() does "
                          "NOT do this -- it drains PyTorch's queues, not oneCCL's own. Use this to "
                          "test whether an in-flight collective racing the allocator is the fault.")
+    ap.add_argument("--mem-snapshot", type=int, default=0, metavar="STEP",
+                    help="diagnostic: at this step, every rank prints its allocator segment address "
+                         "ranges. Compare against the GPU fault address to learn whether the faulting "
+                         "memory is PyTorch's or oneCCL's -- see dump_mem_segments(). Use the step "
+                         "just before the known fault (e.g. 19002).")
     ap.add_argument("--sync-stages", type=int, default=0, metavar="N",
                     help="diagnostic: device-sync and print the stage after each phase of the first N "
                          "steps, from EVERY rank. A GPU page fault aborts the process with no Python "
@@ -285,6 +317,8 @@ def main():
             shape = tuple(batch["tokens"].shape)
             n_tok = batch["tokens"].numel()                    # canvas tokens processed this step (B*L)
             stage("h2d", shape)
+            if args.mem_snapshot and step == args.mem_snapshot:
+                dump_mem_segments(dev, env.rank, step)
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
                 loss, m = training_step(model, batch, p_uncond=ocfg.p_uncond,
