@@ -18,7 +18,7 @@ import torch
 
 from config import CFG, SWISSPROT_CSV, UNANNOTATED_SHARDS, TEXT_ENCODER, TEXT_CACHE, BLOSUM_MAT, CKPT_DIR
 from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
-                   broadcast_checkpoint_bytes, preallocate_grad_buffer)
+                   broadcast_checkpoint_bytes, preallocate_grad_buffer, grad_buffer_range)
 from .recurrent_oadm import RecurrentOADM, count_params
 from .objective import training_step
 from .sampler import generate
@@ -137,31 +137,45 @@ def eval_sample_lengths(model, dev, n, canvas, steps, seed=1234):
     return lens.mean().item(), lens.std().item(), int((lens >= canvas).sum())
 
 
-def dump_mem_segments(dev, rank, step):
-    """Print the caching allocator's segment address ranges for this rank.
+def dump_mem_landmarks(model, dev, tag):
+    """Print device ADDRESS LANDMARKS so a GPU fault address can be attributed to an owner.
 
-    Why this matters: the GPU fault address has been IDENTICAL across every run so far -- three
-    values whose low 44 bits all read 0xfffff0e00000, differing only in the byte that encodes the
-    tile. That is one specific allocation, not a race on random memory. So the question collapses to
-    a single bit: does that address fall INSIDE a PyTorch segment?
+    The GPU faults cluster in a ~44MB window near the top of the address space and are identical
+    across ranks (deterministic location, racy victim), so knowing which arena that window belongs
+    to says where the fix has to go:
+      in/near the all-reduce buffer -> oneCCL is reading the one buffer we hand it, after the
+        mapping for it went stale. Fix is in how we give buffers to the collective.
+      in/near the parameter or activation arena -> oneCCL is reading recycled PyTorch memory
+        through a cached IPC handle. Same conclusion, wider blast radius.
+      nowhere near any of them -> the memory is oneCCL's own (800MB device cache, 1GB scaleout
+        buffer) and our allocator churn is only the trigger. Fix is pure CCL configuration.
 
-      inside  -> the memory is PyTorch's, and something outside PyTorch (oneCCL, through a cached
-                 IPC handle) is reading it after the allocator recycled or released it. Fix belongs
-                 in how we hand buffers to the collective.
-      outside -> the memory is oneCCL's own (its device cache is 800MB, its scaleout buffer 1GB),
-                 and our allocator churn is only the trigger. Fix belongs in the CCL configuration.
+    Uses data_ptr() rather than memory_snapshot(): Aurora's torch 2.10 does not ship
+    torch.xpu.memory_snapshot, so the CUDA-style segment dump is unavailable here.
 
-    Grep the job log for the fault address against these ranges.
+    Printed on rank 0 only -- every rank builds the identical model and shape sequence, and we have
+    already observed the same fault address on different ranks, so one rank's layout is the layout.
     """
-    snap = getattr(torch.xpu, "memory_snapshot", None) if dev.type == "xpu" else None
-    if snap is None:
-        print(f"[mem] rank {rank}: no memory_snapshot on this device type", file=sys.stderr, flush=True)
-        return
-    for s in snap():
-        addr, size = s.get("address"), s.get("total_size", 0)
-        if addr is not None:
-            print(f"[mem] rank {rank} step {step} seg 0x{addr:012x}-0x{addr + size:012x} "
-                  f"size {size} {s.get('segment_type', '?')}", file=sys.stderr, flush=True)
+    parts = [f"[mem] {tag}"]
+    rng = grad_buffer_range()
+    if rng:
+        parts.append(f"allreduce_buf=0x{rng[0]:012x}+{rng[1] / 1e6:.0f}MB(end 0x{rng[0] + rng[1]:012x})")
+    ps = [p for p in model.parameters()]
+    if ps:
+        lo = min(p.data_ptr() for p in ps)
+        hi = max(p.data_ptr() + p.numel() * p.element_size() for p in ps)
+        parts.append(f"params=0x{lo:012x}-0x{hi:012x}")
+    # A transient the size of one checkpoint-recompute burst, to show where activations land.
+    try:
+        probe = torch.empty(32 * 1024 * 1024, dtype=torch.bfloat16, device=dev)
+        parts.append(f"activation_probe=0x{probe.data_ptr():012x}+64MB")
+        del probe
+    except Exception as ex:                                    # OOM here must not kill the run
+        parts.append(f"activation_probe=failed({type(ex).__name__})")
+    stats = getattr(torch, dev.type, None)
+    if stats is not None and hasattr(stats, "memory_reserved"):
+        parts.append(f"reserved={stats.memory_reserved() / 1e9:.1f}GB")
+    print(" | ".join(parts), file=sys.stderr, flush=True)
 
 
 def main():
@@ -182,10 +196,9 @@ def main():
                          "NOT do this -- it drains PyTorch's queues, not oneCCL's own. Use this to "
                          "test whether an in-flight collective racing the allocator is the fault.")
     ap.add_argument("--mem-snapshot", type=int, default=0, metavar="STEP",
-                    help="diagnostic: at this step, every rank prints its allocator segment address "
-                         "ranges. Compare against the GPU fault address to learn whether the faulting "
-                         "memory is PyTorch's or oneCCL's -- see dump_mem_segments(). Use the step "
-                         "just before the known fault (e.g. 19002).")
+                    help="diagnostic: also print the device address landmarks at this step, not just "
+                         "at startup, so activation addresses are sampled mid-run. Landmarks are "
+                         "logged at startup unconditionally -- see dump_mem_landmarks().")
     ap.add_argument("--sync-stages", type=int, default=0, metavar="N",
                     help="diagnostic: device-sync and print the stage after each phase of the first N "
                          "steps, from EVERY rank. A GPU page fault aborts the process with no Python "
@@ -292,6 +305,10 @@ def main():
     n_grad = preallocate_grad_buffer(model, dev)
     if env.is_main and n_grad:
         print(f"[train] all-reduce buffer preallocated: {4 * (n_grad + 1) / 1e6:.0f}MB fp32", flush=True)
+    # Unconditional and cheap: every run (including every ladder rung) now records where its device
+    # memory lives, so any future GPU fault address can be attributed without a dedicated job.
+    if env.is_main:
+        dump_mem_landmarks(model, dev, f"startup rank {env.rank}")
 
     total = args.max_steps or (60 if args.smoke else ocfg.total_steps)
     log_every = 10 if args.smoke else ocfg.log_every
@@ -317,8 +334,8 @@ def main():
             shape = tuple(batch["tokens"].shape)
             n_tok = batch["tokens"].numel()                    # canvas tokens processed this step (B*L)
             stage("h2d", shape)
-            if args.mem_snapshot and step == args.mem_snapshot:
-                dump_mem_segments(dev, env.rank, step)
+            if args.mem_snapshot and step == args.mem_snapshot and env.is_main:
+                dump_mem_landmarks(model, dev, f"step {step} rank {env.rank}")
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
                 loss, m = training_step(model, batch, p_uncond=ocfg.p_uncond,
