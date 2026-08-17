@@ -1,0 +1,202 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N protgen_gcladder
+#PBS -l walltime=01:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug-scaling
+#PBS -j oe
+#
+# Bisect the gradient-checkpointing GPU page fault in ONE job.
+#
+# Established so far: the fault needs --grad-checkpoint (it runs clean without), does NOT need ipex
+# (--no-ipex still faults), and does NOT reproduce on a single tile even with the real batch, the
+# real weights, all four bucket shapes and the job's device env (640 steps clean). So it lives in the
+# interaction between checkpointing's per-step allocator churn and oneCCL's device memory -- most
+# likely a stale Level-Zero IPC mapping, since a read of a NotPresent page is memory that was mapped
+# when a handle was cached and is not now.
+#
+# Each rung changes exactly ONE variable against the same baseline (--grad-checkpoint, resumed from
+# the same checkpoint). Rungs are NOT cumulative -- a cumulative ladder cannot tell you which knob
+# mattered. A rung that faults escalates to the next; the first rung to survive PASS_STEPS is the
+# answer and the ladder stops there.
+#
+# Failing rungs are cheap: the fault lands within ~3 steps with ipex and ~200 without, so the budget
+# is dominated by startup plus the single surviving rung.
+#
+#   qsub scripts/gc_ladder.pbs
+#   PASS_STEPS=800 qsub scripts/gc_ladder.pbs      # stricter survival bar, fewer rungs fit
+#
+# NB the queue: 16 nodes for 1h does not fit `debug` (2 nodes / 1h). debug-scaling is up to 32 nodes
+# on Aurora -- confirm against current ALCF policy before trusting the header above.
+
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+# --- tunables ---------------------------------------------------------------------------------
+RESUME_STEP=${RESUME_STEP:-19000}      # checkpoint to resume every rung from
+PASS_STEPS=${PASS_STEPS:-400}          # steps past resume that count as surviving. Observed faults
+                                       # land by ~200, so this is ~2x the worst case -- enough to
+                                       # rank the knobs, NOT enough to declare a rung truly fixed.
+RUNG_WALL=${RUNG_WALL:-600}            # hard per-rung wall (s); a oneCCL hang must not eat the job
+RESERVE=${RESERVE:-480}                # do not start a new rung with less than this left (s)
+LADDER_SECONDS=${LADDER_SECONDS:-3600} # KEEP IN SYNC with the #PBS walltime above
+SETTLE=${SETTLE:-15}                   # pause after a faulted rung so PALS can reap banned contexts
+CCL_INFO_PROBE=${CCL_INFO_PROBE:-1}    # 2-step CCL_LOG_LEVEL=info run first, to record the algorithm
+
+START=$(date +%s)
+DEADLINE=$(( START + LADDER_SECONDS - 180 ))   # leave room for the summary and PBS teardown
+
+# config.py owns every path, so ask it rather than hardcoding /flare here.
+REAL_CKPT_DIR=$(python -c "import config; print(config.CKPT_DIR)") || exit 1
+RESUME_CKPT="${REAL_CKPT_DIR}/ckpt_$(printf '%08d' "$RESUME_STEP").pt"
+LADDER_DIR="${REAL_CKPT_DIR%/checkpoints}/gc_ladder.${PBS_JOBID:-interactive}"
+CKPT_SCRATCH="${LADDER_DIR}/ckpt"
+
+if [ ! -f "$RESUME_CKPT" ]; then
+    echo "FATAL: $RESUME_CKPT not found. Set RESUME_STEP to a checkpoint that still exists" >&2
+    echo "       (save_checkpoint keeps only the newest 3):" >&2
+    ls -1 "$REAL_CKPT_DIR"/ckpt_*.pt 2>/dev/null >&2
+    exit 1
+fi
+
+mkdir -p "$CKPT_SCRATCH" || exit 1
+# THE ONE PROTGEN_* OVERRIDE IN ANY JOB SCRIPT, and a deliberate exception to the rule in
+# pbs_common.sh. Every rung finishing normally calls save_checkpoint, which rewrites latest.txt --
+# against the real directory that would silently repoint production resumes at a diagnostic
+# checkpoint, and would change the resume step (and therefore the epoch seed, and therefore the
+# data) out from under later rungs. It is not silent: job_banner prints the resolved paths below.
+export PROTGEN_CKPT_DIR="$CKPT_SCRATCH"
+ln -sfn "$RESUME_CKPT" "${CKPT_SCRATCH}/$(basename "$RESUME_CKPT")"
+
+job_banner "gradient-checkpoint fault ladder" RESUME_CKPT PASS_STEPS RUNG_WALL LADDER_DIR
+echo "  rungs write per-rung logs to ${LADDER_DIR}/"
+
+# Reset to an identical starting state before every rung: drop any checkpoint a rung wrote (real
+# files only -- the symlink to the shared checkpoint is -type l and survives) and repoint latest.txt.
+seed_ckpt() {
+    find "$CKPT_SCRATCH" -maxdepth 1 -name 'ckpt_*.pt' -type f -delete
+    echo "$(basename "$RESUME_CKPT")" > "${CKPT_SCRATCH}/latest.txt"
+}
+
+MAX_STEPS=$(( RESUME_STEP + PASS_STEPS ))
+
+# Run one rung in a subshell so its env assignments cannot leak into the next.
+# $1 name, $2 space-separated VAR=VAL list, $3 extra train.py args, $4 log path
+run_rung() {
+    local envs="$2" extra="$3" log="$4" kv
+    seed_ckpt
+    (
+        for kv in $envs; do export "$kv"; done
+        timeout --signal=TERM --kill-after=60 "$RUNG_WALL" \
+            "${MPI_LAUNCH[@]}" python -m src.train --device xpu \
+                --max-steps "$MAX_STEPS" --eval-every 0 $extra
+    ) > "$log" 2>&1
+}
+
+# --- the ladder -------------------------------------------------------------------------------
+# name | env overrides | extra train.py args
+RUNGS=(
+  "R0-reproduce||--grad-checkpoint"
+  "R1-drain-collectives||--grad-checkpoint --drain-collectives"
+  "R2-ze-cache-off|CCL_ZE_CACHE=0|--grad-checkpoint"
+  "R3-ipc-drmfd|CCL_ZE_IPC_EXCHANGE=drmfd|--grad-checkpoint"
+  "R4-ze-disabled|CCL_ZE_ENABLE=0|--grad-checkpoint"
+  "R5-expandable-on|PYTORCH_XPU_ALLOC_CONF=expandable_segments:True|--grad-checkpoint"
+  "R6-expandable-off|PYTORCH_XPU_ALLOC_CONF=expandable_segments:False|--grad-checkpoint"
+)
+
+# Optional first pass purely to record which allreduce algorithm oneCCL selects, so the rungs below
+# are not guesswork about which code path is even in play. Expected to fault; we only want the log.
+if [ "$CCL_INFO_PROBE" = 1 ]; then
+    echo; echo "===== probe: CCL_LOG_LEVEL=info, 2 steps (expected to fault; capturing algorithm) ====="
+    seed_ckpt
+    ( export CCL_LOG_LEVEL=info
+      timeout --signal=TERM --kill-after=60 300 \
+        "${MPI_LAUNCH[@]}" python -m src.train --device xpu \
+            --max-steps $(( RESUME_STEP + 2 )) --eval-every 0 --grad-checkpoint
+    ) > "${LADDER_DIR}/ccl-info.log" 2>&1
+    grep -iE "allreduce|algo|topo|ipc|ze_cache" "${LADDER_DIR}/ccl-info.log" \
+        | sed 's/^/    /' | sort -u | head -40
+    echo "  (full log: ${LADDER_DIR}/ccl-info.log)"
+fi
+
+declare -a RESULTS
+WINNER=""
+SKIPPED=0
+for entry in "${RUNGS[@]}"; do
+    IFS='|' read -r name envs extra <<< "$entry"
+    left=$(( DEADLINE - $(date +%s) ))
+    if [ "$left" -lt "$RESERVE" ]; then
+        RESULTS+=("$(printf '%-22s SKIPPED  (only %ds left)' "$name" "$left")")
+        SKIPPED=$(( SKIPPED + 1 ))
+        continue
+    fi
+
+    log="${LADDER_DIR}/${name}.log"
+    echo; echo "===== ${name} =====  env:[${envs:-none}] args:[${extra}]  ${left}s left"
+    t0=$(date +%s)
+    run_rung "$name" "$envs" "$extra" "$log"
+    rc=$?
+    dt=$(( $(date +%s) - t0 ))
+
+    # Trust the trainer's own completion line, not the exit code: an aborting rank makes mpiexec
+    # report 143 via SIGTERM cleanup, which is indistinguishable from other failures by code alone.
+    if grep -q "\[train\] done at step" "$log"; then
+        RESULTS+=("$(printf '%-22s SURVIVED %d steps in %ds' "$name" "$PASS_STEPS" "$dt")")
+        WINNER="$name"
+        echo "  -> SURVIVED. Stopping the ladder."
+        tail -4 "$log" | sed 's/^/    /'
+        break
+    fi
+
+    if grep -q "Segmentation fault from GPU" "$log"; then why="GPU page fault"
+    elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then why="hit the ${RUNG_WALL}s rung wall (hang?)"
+    else why="failed rc=$rc"; fi
+    reached=$(grep -oE "^step +[0-9]+" "$log" | tail -1 | tr -s ' ')
+    RESULTS+=("$(printf '%-22s FAULTED  %s in %ds (last %s)' "$name" "$why" "$dt" "${reached:-no step logged}")")
+    echo "  -> ${why}. Escalating."
+    grep -E "Segmentation fault from GPU|died from signal" "$log" | head -3 | sed 's/^/    /'
+    # A faulted rung leaves its GPU contexts banned ("banned: 1"); give PALS a moment to reap the
+    # ranks before the next rung claims the same tiles.
+    sleep "$SETTLE"
+done
+
+echo; echo "================================ LADDER SUMMARY ================================"
+printf '  resumed from : %s\n' "$RESUME_CKPT"
+printf '  survival bar : %s steps past resume\n' "$PASS_STEPS"
+for r in "${RESULTS[@]}"; do echo "  $r"; done
+if [ "$WINNER" = "R0-reproduce" ]; then
+    echo
+    echo "  => THE LADDER PROVED NOTHING. R0 is the control and carries no fix, so it was supposed"
+    echo "     to fault; surviving means this harness is not reproducing the bug and the rungs below"
+    echo "     it never ran. Check first: is ${RESUME_STEP} still the checkpoint that faults (the"
+    echo "     epoch seed is the resume step, so a different checkpoint walks different data)? Did"
+    echo "     the banner above show 12 devices, level_zero:gpu and FLAT? Is PASS_STEPS too small?"
+elif [ -n "$WINNER" ]; then
+    echo
+    echo "  => ${WINNER} is the first single change that survived."
+    echo "     ${PASS_STEPS} steps is ~2x the worst observed time-to-fault: enough to rank the knobs,"
+    echo "     NOT enough to call it fixed. Confirm with a full-walltime run at that setting before"
+    echo "     trusting it, and check peak HBM is back down near 15GB (i.e. recompute really is on)."
+elif [ "$SKIPPED" -gt 0 ]; then
+    echo
+    echo "  => OUT OF TIME with ${SKIPPED} rung(s) never run, so the ladder is INCONCLUSIVE: the"
+    echo "     answer may still be in a rung below. Resubmit with the faulted rungs deleted from"
+    echo "     RUNGS, or with a lower PASS_STEPS. Startup (CSV parse + 96M-sequence shard index +"
+    echo "     checkpoint broadcast) is a few minutes per rung and dominates the budget."
+else
+    echo
+    echo "  => every rung faulted. The fault is in none of these knobs; next steps:"
+    echo "     - read ${LADDER_DIR}/ccl-info.log for the selected algorithm, then target that path"
+    echo "     - try combinations (this ladder is deliberately single-variable)"
+    echo "     - file with ALCF support: 16 nodes, --grad-checkpoint as the single toggle,"
+    echo "       ${RESUME_CKPT} reproduces within ~200 steps, ipex-independent, no single-tile repro"
+    echo "     - fallback: collapse to one fixed batch shape to remove the allocator churn"
+fi
+echo "  logs: ${LADDER_DIR}/"
+echo "================================================================================"
+
+# Exit 0 when the ladder itself completed: faulting rungs are the expected data, not job failure.
+exit 0
