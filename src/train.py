@@ -146,8 +146,9 @@ def main():
     ap.add_argument("--no-ipex", action="store_true", help="skip ipex.optimize (eager XPU; robust to dynamic shapes)")
     ap.add_argument("--eval-every", type=int, default=None,
                     help="override opt.eval_every for the sampling eval (0 disables it)")
-    ap.add_argument("--no-grad-checkpoint", action="store_true",
-                    help="disable recurrence-loop gradient checkpointing (more HBM, ~25%% less fwd compute)")
+    ap.add_argument("--grad-checkpoint", default=None, action=argparse.BooleanOptionalAction,
+                    help="recurrence-loop gradient checkpointing (default off: see Config.grad_checkpoint "
+                         "-- it currently page-faults the GPU inside backward at 16 nodes)")
     ap.add_argument("--sync-stages", type=int, default=0, metavar="N",
                     help="diagnostic: device-sync and print the stage after each phase of the first N "
                          "steps, from EVERY rank. A GPU page fault aborts the process with no Python "
@@ -160,8 +161,8 @@ def main():
     dev = env.device
     torch.manual_seed(CFG.opt.seed + env.rank)
     mcfg, dcfg, ocfg = CFG.model_config(), CFG.data, CFG.opt
-    if args.no_grad_checkpoint:
-        mcfg.grad_checkpoint = False
+    if args.grad_checkpoint is not None:
+        mcfg.grad_checkpoint = args.grad_checkpoint
 
     # --- model ---
     model = RecurrentOADM(mcfg).to(dev)

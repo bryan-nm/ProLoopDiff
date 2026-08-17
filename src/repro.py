@@ -79,22 +79,31 @@ def main():
                          "epoch ordinal. Getting this wrong replays a completely different batch.")
     ap.add_argument("--batch", type=int, required=True,
                     help="index of the batch WITHIN that epoch (crashing step - epoch start step)")
-    ap.add_argument("--iters", type=int, default=20, help="replays of the batch (corruption varies)")
+    ap.add_argument("--batches", type=int, default=16,
+                    help="replay this many CONSECUTIVE batches from --batch onward, in order. This "
+                         "matters: consecutive training steps draw from DIFFERENT length buckets, so "
+                         "the real run cycles shapes every step. Gradient checkpointing frees every "
+                         "activation after forward and reallocates a burst during backward; combined "
+                         "with changing sizes that forces the caching allocator to split and merge "
+                         "blocks constantly. Replaying ONE fixed shape never exercises that, which is "
+                         "the likeliest reason a single-tile repro looked clean.")
+    ap.add_argument("--iters", type=int, default=20,
+                    help="passes over the batch sequence (corruption randomness varies each pass)")
     ap.add_argument("--ckpt", default=None,
                     help="checkpoint to load weights from. Use the one the run resumed from -- if the "
                          "fault depends on the model state and not just the data, random init hides it.")
     ap.add_argument("--no-ipex", action="store_true", help="skip ipex.optimize (eager XPU)")
-    ap.add_argument("--no-grad-checkpoint", action="store_true",
-                    help="disable recurrence-loop gradient checkpointing (isolates it; the fault is "
-                         "inside backward, which is where checkpointing does its recompute)")
+    ap.add_argument("--grad-checkpoint", default=None, action=argparse.BooleanOptionalAction,
+                    help="override Config.grad_checkpoint (now default OFF). Pass --grad-checkpoint "
+                         "to chase the fault, which lives in backward where the recompute happens.")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
 
     env = init_distributed(args.device)          # single process
     dev = env.device
     cfg, dcfg, ocfg = CFG.model_config(), CFG.data, CFG.opt
-    if args.no_grad_checkpoint:
-        cfg.grad_checkpoint = False
+    if args.grad_checkpoint is not None:
+        cfg.grad_checkpoint = args.grad_checkpoint
     torch.manual_seed(ocfg.seed + args.rank)
 
     tok = ProteinTokenizer(cfg)
@@ -109,19 +118,23 @@ def main():
                                     rank=args.rank, world=args.world, seed=ocfg.seed)
     collate = make_collate(embedder, cfg, dcfg.length_buckets, dcfg.max_text_tokens)
 
-    sampler.set_epoch(args.epoch)                # MUST match the trainer, or the batch is not the same one
-    idxs = None                                  # fast-forward to this rank's `batch`-th batch of the epoch
+    sampler.set_epoch(args.epoch)                # MUST match the trainer, or these are not the same batches
+    batches = []                                 # kept on the HOST; moved per step like the trainer does
     for i, b in enumerate(sampler):
-        if i == args.batch:
-            idxs = b
-            break
-    if idxs is None:
+        if i >= args.batch:
+            batches.append(collate([ds[j] for j in b]))
+            if len(batches) == args.batches:
+                break
+    if not batches:
         raise SystemExit(f"rank {args.rank} yields fewer than {args.batch + 1} batches in epoch {args.epoch}")
-    batch = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in collate([ds[j] for j in idxs]).items()}
     use_ipex = ipex is not None and dev.type == "xpu" and ocfg.use_ipex and not args.no_ipex
-    print(f"[repro] rank={args.rank} world={args.world} epoch={args.epoch} batch={args.batch} on {dev} | "
-          f"tokens={tuple(batch['tokens'].shape)} n_labelled={int(batch['labelled'].sum())} "
-          f"ipex={use_ipex} grad_checkpoint={cfg.grad_checkpoint}", flush=True)
+    shapes = [tuple(b["tokens"].shape) for b in batches]
+    print(f"[repro] rank={args.rank} world={args.world} epoch={args.epoch} batch={args.batch}"
+          f"..{args.batch + len(batches) - 1} on {dev} | ipex={use_ipex} "
+          f"grad_checkpoint={cfg.grad_checkpoint}\n[repro] shape sequence: {shapes}", flush=True)
+    if len(set(shapes)) == 1:
+        print("[repro] WARNING: every replayed batch has the same shape, so this run does NOT "
+              "reproduce the trainer's per-step shape cycling. Raise --batches.", flush=True)
 
     sub_probs = blosum_sub_probs(BLOSUM_MAT, temp=ocfg.blosum_temp).to(dev) if os.path.exists(BLOSUM_MAT) else None
     model = RecurrentOADM(cfg).to(dev)
@@ -135,10 +148,14 @@ def main():
         print(f"[repro] loaded weights from {args.ckpt} (saved at step {ck.get('step', '?')})", flush=True)
     model.train()
     for it in range(args.iters):
-        model.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=dev.type in ("xpu", "cuda")):
-            staged_step(model, batch, cfg, ocfg, sub_probs, dev, it)
-    print("[repro] completed all iters WITHOUT a fault", flush=True)
+        for k, host_batch in enumerate(batches):
+            # Move per step, exactly as the trainer does, so the H2D + alloc/free pattern matches.
+            batch = {n: (v.to(dev) if torch.is_tensor(v) else v) for n, v in host_batch.items()}
+            model.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=dev.type, dtype=torch.bfloat16,
+                                enabled=dev.type in ("xpu", "cuda")):
+                staged_step(model, batch, cfg, ocfg, sub_probs, dev, f"{it}.{k} {tuple(batch['tokens'].shape)}")
+    print(f"[repro] completed {args.iters} passes over {len(batches)} batches WITHOUT a fault", flush=True)
 
 
 if __name__ == "__main__":
