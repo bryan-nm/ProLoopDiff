@@ -30,21 +30,15 @@ Design commitments encoded here (see conversation):
     defined in a space RoPE provably does not mix. This separation is the whole point — see
     SelfAttention (RoPE here) vs PBConditioning (no RoPE, ever).
 
-(4) Conditioning is learned from the generative loss alone (via CFG and the learned null token).
-    An earlier revision also carried a FiLIP token-level contrastive head on the PB features; it
-    has been removed. If a text/protein alignment objective is wanted again, add it out-of-loop
-    against frozen features rather than as an in-loop contrastive on z.
 """
 
 from __future__ import annotations
-import contextlib
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint
 
 
 # --------------------------------------------------------------------------------------
@@ -76,17 +70,6 @@ class Config:
     rope_base: float = 10000.0
     dropout: float = 0.0
     tie_embeddings: bool = True
-    # Recompute each recurrence pass during backward instead of storing its activations. The middle
-    # stack is re-entered n_recurrence times, so a pass is a natural checkpoint boundary. Costs one
-    # extra forward of the middle stack (~+25% forward FLOPs at N=3); saves most of the middle-stack
-    # activations (measured 38.1 -> 15.1 GB at 16 nodes). Training-only; ignored under eval/no_grad.
-    #
-    # DEFAULT OFF pending an unresolved fault. At 16 nodes this reliably page-faults the GPU inside
-    # backward within a few hundred steps; --no-grad-checkpoint runs clean, and --no-ipex still
-    # faults, so checkpointing is necessary for the bug and ipex is not. 38 GB of 64 fits fine at the
-    # current model size, so nothing is lost by leaving it off until this is understood -- but it is
-    # required before scaling the model up. Re-enable with --grad-checkpoint.
-    grad_checkpoint: bool = False
 
 
 # --------------------------------------------------------------------------------------
@@ -151,26 +134,6 @@ class RotaryEmbedding(nn.Module):
         sin = emb.sin()[None, None, :, :].to(dtype)
         self._cache[key] = (cos, sin)
         return cos, sin
-
-
-def _device_guard(device: torch.device):
-    """Pin the current device for the enclosing block.
-
-    checkpoint()'s recompute does not run on the thread that ran the forward -- it runs inside the
-    autograd engine's backward worker thread. set_device() is per-thread, so any allocation or launch
-    in the recomputed region that does not derive its device from a tensor argument can land on that
-    thread's current device rather than this rank's tile. On local_rank 0 the two coincide, which is
-    why a single-tile run cannot expose it. Ordinary backward is unaffected: generated backward
-    nodes carry their own DeviceGuard, so only the recompute is exposed.
-
-    This is cheap insurance, not a confirmed diagnosis -- one observed faulting rank (12 of 12/node)
-    was local_rank 0, which this would not explain.
-    """
-    if device.type == "xpu" and hasattr(torch, "xpu") and device.index is not None:
-        return torch.xpu.device(device.index)
-    if device.type == "cuda" and device.index is not None:
-        return torch.cuda.device(device.index)
-    return contextlib.nullcontext()
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -417,28 +380,10 @@ class RecurrentOADM(nn.Module):
             x = l(x, keep_mask)
         h_up = x                                                # upstream output for re-injection
 
-        def _pass(x_in, h, te_, keep_, gen_keep_):
-            with _device_guard(x_in.device):                    # see _device_guard: recompute runs
-                x_ = x_in + torch.tanh(self.reinject_gate) * h  # on the autograd worker thread
-                for l in self.mid_layers:
-                    x_ = l(x_, keep_, te_, gen_keep_)
-            return x_
-
-        # use_reentrant=False is required, not stylistic. The reentrant implementation only returns
-        # gradients for tensor arguments that require grad; module parameters and any closed-over
-        # tensors silently get none. The non-reentrant path builds the real autograd graph in the
-        # forward and only defers the *saved tensors*, so every parameter is differentiated normally.
-        # h_up is passed as an argument rather than captured for the same belt-and-braces reason.
-        # preserve_rng_state costs a device RNG save/restore per checkpoint and is only needed if the
-        # recomputed region is stochastic; at dropout=0 it is not.
-        ckpt = cfg.grad_checkpoint and self.training and torch.is_grad_enabled()
         for _ in range(N):
-            if ckpt:
-                x = torch.utils.checkpoint.checkpoint(
-                    _pass, x, h_up, te, keep_mask, gen_keep,
-                    use_reentrant=False, preserve_rng_state=(cfg.dropout > 0))
-            else:
-                x = _pass(x, h_up, te, keep_mask, gen_keep)
+            x = x + torch.tanh(self.reinject_gate) * h_up
+            for l in self.mid_layers:
+                x = l(x, keep_mask, te, gen_keep)
 
         for l in self.down_layers:
             x = l(x, keep_mask)

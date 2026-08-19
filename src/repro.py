@@ -22,7 +22,6 @@ backward, at 192 ranks. Reproduce and then bisect, in an interactive session:
 
     python -m src.repro --rank 29 --world 192 --epoch 19001 --batch 2 \\
         --ckpt .../ckpt_00019000.pt --device xpu
-    python -m src.repro ... --no-grad-checkpoint     # is it the recompute in backward?
     python -m src.repro ... --no-ipex                # is it ipex.optimize's backward?
 
 The batch CONTENT is exact; the corruption randomness is not replayed, so we loop the step a few
@@ -88,30 +87,22 @@ def main():
     ap.add_argument("--batch", type=int, required=True,
                     help="index of the batch WITHIN that epoch (crashing step - epoch start step)")
     ap.add_argument("--batches", type=int, default=16,
-                    help="replay this many CONSECUTIVE batches from --batch onward, in order. This "
-                         "matters: consecutive training steps draw from DIFFERENT length buckets, so "
-                         "the real run cycles shapes every step. Gradient checkpointing frees every "
-                         "activation after forward and reallocates a burst during backward; combined "
-                         "with changing sizes that forces the caching allocator to split and merge "
-                         "blocks constantly. Replaying ONE fixed shape never exercises that, which is "
-                         "the likeliest reason a single-tile repro looked clean.")
+                    help="replay this many CONSECUTIVE batches from --batch onward, in order. "
+                         "Consecutive training steps draw from DIFFERENT length buckets, so "
+                         "replaying ONE fixed shape does not exercise the allocator churn "
+                         "that the real run sees.")
     ap.add_argument("--iters", type=int, default=20,
                     help="passes over the batch sequence (corruption randomness varies each pass)")
     ap.add_argument("--ckpt", default=None,
                     help="checkpoint to load weights from. Use the one the run resumed from -- if the "
                          "fault depends on the model state and not just the data, random init hides it.")
     ap.add_argument("--no-ipex", action="store_true", help="skip ipex.optimize (eager XPU)")
-    ap.add_argument("--grad-checkpoint", default=None, action=argparse.BooleanOptionalAction,
-                    help="override Config.grad_checkpoint (now default OFF). Pass --grad-checkpoint "
-                         "to chase the fault, which lives in backward where the recompute happens.")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
 
     env = init_distributed(args.device)          # single process
     dev = env.device
     cfg, dcfg, ocfg = CFG.model_config(), CFG.data, CFG.opt
-    if args.grad_checkpoint is not None:
-        cfg.grad_checkpoint = args.grad_checkpoint
     torch.manual_seed(ocfg.seed + args.rank)
 
     tok = ProteinTokenizer(cfg)
@@ -138,8 +129,8 @@ def main():
     use_ipex = ipex is not None and dev.type == "xpu" and ocfg.use_ipex and not args.no_ipex
     shapes = [tuple(b["tokens"].shape) for b in batches]
     print(f"[repro] rank={args.rank} world={args.world} epoch={args.epoch} batch={args.batch}"
-          f"..{args.batch + len(batches) - 1} on {dev} | ipex={use_ipex} "
-          f"grad_checkpoint={cfg.grad_checkpoint}\n[repro] shape sequence: {shapes}", flush=True)
+          f"..{args.batch + len(batches) - 1} on {dev} | ipex={use_ipex}"
+          f"\n[repro] shape sequence: {shapes}", flush=True)
     if len(set(shapes)) == 1:
         print("[repro] WARNING: every replayed batch has the same shape, so this run does NOT "
               "reproduce the trainer's per-step shape cycling. Raise --batches.", flush=True)

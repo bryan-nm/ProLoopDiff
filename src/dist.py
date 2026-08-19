@@ -206,17 +206,6 @@ def preallocate_grad_buffer(model, device) -> int:
     return n
 
 
-def grad_buffer_range():
-    """(address, size_in_bytes) of the persistent all-reduce buffer, or None if not allocated.
-
-    This is the ONLY device memory this process hands to oneCCL, so it is the first thing a GPU
-    fault address should be compared against.
-    """
-    if _GRAD_BUF is None:
-        return None
-    return _GRAD_BUF.data_ptr(), _GRAD_BUF.numel() * _GRAD_BUF.element_size()
-
-
 def average_gradients(model) -> bool:
     """All-reduce the gradients. Returns True if ANY rank produced a non-finite gradient this step.
 

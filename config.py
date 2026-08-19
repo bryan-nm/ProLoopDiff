@@ -68,10 +68,6 @@ class OptCfg:
     max_skip_streak: int = 20
     # objective
     p_uncond: float = 0.15               # CFG dropout on labelled rows
-    # NB: the FiLIP token-level contrastive auxiliary has been REMOVED, not just disabled. Its backward
-    # under ipex.optimize at scale intermittently faulted the GPU. Conditioning is learned from the
-    # generative loss + CFG via the PB cross-attention, standard for cross-attn diffusion. If an
-    # alignment objective is wanted again, add it out-of-loop on frozen features.
     pad_loss_weight: float = 0.1         # down-weight PAD in OADM loss (fixed-512 canvas has a long PAD tail)
     beta: float = 0.5                    # hybrid substitution floor (low-corruption)
     beta_schedule: bool = True           # corruption-level beta (absorbing at high corruption)

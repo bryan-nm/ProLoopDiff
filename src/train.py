@@ -10,7 +10,6 @@ Launch (Aurora): via train.pbs (mpiexec, one rank per tile). Local smoke:
 from __future__ import annotations
 import io
 import os
-import sys
 import math
 import time
 import argparse
@@ -18,7 +17,7 @@ import torch
 
 from config import CFG, SWISSPROT_CSV, UNANNOTATED_SHARDS, TEXT_ENCODER, TEXT_CACHE, BLOSUM_MAT, CKPT_DIR
 from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
-                   broadcast_checkpoint_bytes, preallocate_grad_buffer, grad_buffer_range)
+                   broadcast_checkpoint_bytes, preallocate_grad_buffer)
 from .recurrent_oadm import RecurrentOADM, count_params
 from .objective import training_step
 from .sampler import generate
@@ -137,47 +136,6 @@ def eval_sample_lengths(model, dev, n, canvas, steps, seed=1234):
     return lens.mean().item(), lens.std().item(), int((lens >= canvas).sum())
 
 
-def dump_mem_landmarks(model, dev, tag):
-    """Print device ADDRESS LANDMARKS so a GPU fault address can be attributed to an owner.
-
-    The GPU faults cluster in a ~44MB window near the top of the address space and are identical
-    across ranks (deterministic location, racy victim), so knowing which arena that window belongs
-    to says where the fix has to go:
-      in/near the all-reduce buffer -> oneCCL is reading the one buffer we hand it, after the
-        mapping for it went stale. Fix is in how we give buffers to the collective.
-      in/near the parameter or activation arena -> oneCCL is reading recycled PyTorch memory
-        through a cached IPC handle. Same conclusion, wider blast radius.
-      nowhere near any of them -> the memory is oneCCL's own (800MB device cache, 1GB scaleout
-        buffer) and our allocator churn is only the trigger. Fix is pure CCL configuration.
-
-    Uses data_ptr() rather than memory_snapshot(): Aurora's torch 2.10 does not ship
-    torch.xpu.memory_snapshot, so the CUDA-style segment dump is unavailable here.
-
-    Printed on rank 0 only -- every rank builds the identical model and shape sequence, and we have
-    already observed the same fault address on different ranks, so one rank's layout is the layout.
-    """
-    parts = [f"[mem] {tag}"]
-    rng = grad_buffer_range()
-    if rng:
-        parts.append(f"allreduce_buf=0x{rng[0]:012x}+{rng[1] / 1e6:.0f}MB(end 0x{rng[0] + rng[1]:012x})")
-    ps = [p for p in model.parameters()]
-    if ps:
-        lo = min(p.data_ptr() for p in ps)
-        hi = max(p.data_ptr() + p.numel() * p.element_size() for p in ps)
-        parts.append(f"params=0x{lo:012x}-0x{hi:012x}")
-    # A transient the size of one checkpoint-recompute burst, to show where activations land.
-    try:
-        probe = torch.empty(32 * 1024 * 1024, dtype=torch.bfloat16, device=dev)
-        parts.append(f"activation_probe=0x{probe.data_ptr():012x}+64MB")
-        del probe
-    except Exception as ex:                                    # OOM here must not kill the run
-        parts.append(f"activation_probe=failed({type(ex).__name__})")
-    stats = getattr(torch, dev.type, None)
-    if stats is not None and hasattr(stats, "memory_reserved"):
-        parts.append(f"reserved={stats.memory_reserved() / 1e9:.1f}GB")
-    print(" | ".join(parts), file=sys.stderr, flush=True)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default=CFG.device)
@@ -187,38 +145,17 @@ def main():
     ap.add_argument("--no-ipex", action="store_true", help="skip ipex.optimize (eager XPU; robust to dynamic shapes)")
     ap.add_argument("--eval-every", type=int, default=None,
                     help="override opt.eval_every for the sampling eval (0 disables it)")
-    ap.add_argument("--grad-checkpoint", default=None, action=argparse.BooleanOptionalAction,
-                    help="recurrence-loop gradient checkpointing (default off: see Config.grad_checkpoint "
-                         "-- it currently page-faults the GPU inside backward at 16 nodes)")
-    ap.add_argument("--drain-collectives", action="store_true",
-                    help="diagnostic: barrier() after every gradient all-reduce, forcing oneCCL to "
-                         "complete before the next step allocates. NB torch.xpu.synchronize() does "
-                         "NOT do this -- it drains PyTorch's queues, not oneCCL's own. Use this to "
-                         "test whether an in-flight collective racing the allocator is the fault.")
-    ap.add_argument("--mem-snapshot", type=int, default=0, metavar="STEP",
-                    help="diagnostic: also print the device address landmarks at this step, not just "
-                         "at startup, so activation addresses are sampled mid-run. Landmarks are "
-                         "logged at startup unconditionally -- see dump_mem_landmarks().")
-    ap.add_argument("--sync-stages", type=int, default=0, metavar="N",
-                    help="diagnostic: device-sync and print the stage after each phase of the first N "
-                         "steps, from EVERY rank. A GPU page fault aborts the process with no Python "
-                         "traceback, so the last [stage] line a rank printed names the faulting phase. "
-                         "Grep the .o log for the rank in the abort message. Costs throughput; the "
-                         "syncs also serialise the step, so do not read tok/s from such a run.")
     args = ap.parse_args()
 
     env = init_distributed(args.device)
     dev = env.device
     torch.manual_seed(CFG.opt.seed + env.rank)
     mcfg, dcfg, ocfg = CFG.model_config(), CFG.data, CFG.opt
-    if args.grad_checkpoint is not None:
-        mcfg.grad_checkpoint = args.grad_checkpoint
 
     # --- model ---
     model = RecurrentOADM(mcfg).to(dev)
     if env.is_main:
-        print(f"[train] params={count_params(model)/1e6:.1f}M device={dev} "
-              f"grad_checkpoint={mcfg.grad_checkpoint}", flush=True)
+        print(f"[train] params={count_params(model)/1e6:.1f}M device={dev}", flush=True)
     broadcast_parameters(model)
     sub_probs = blosum_sub_probs(BLOSUM_MAT, temp=ocfg.blosum_temp).to(dev) \
         if os.path.exists(BLOSUM_MAT) else None
@@ -272,8 +209,6 @@ def main():
     if applied_ipex:
         model, opt = ipex.optimize(model, optimizer=opt, dtype=torch.bfloat16)
     if env.is_main:
-        # Report what actually happened. The old message read the config flag, so it printed "ON"
-        # even on a CPU run or when the ipex import had failed -- exactly when you need to know.
         print(f"[train] ipex.optimize {'ON' if applied_ipex else 'OFF'} (device={dev.type}, "
               f"requested={use_ipex}, ipex={'available' if ipex is not None else 'missing'})", flush=True)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, ocfg.warmup_steps, ocfg.total_steps))
@@ -301,14 +236,9 @@ def main():
         if env.is_main:
             print(f"[ckpt] resumed from {ckpt_path}: continuing at step {start_step}", flush=True)
 
-    # Fix the all-reduce buffer's address before the first forward churns the heap (see dist.py).
     n_grad = preallocate_grad_buffer(model, dev)
     if env.is_main and n_grad:
         print(f"[train] all-reduce buffer preallocated: {4 * (n_grad + 1) / 1e6:.0f}MB fp32", flush=True)
-    # Unconditional and cheap: every run (including every ladder rung) now records where its device
-    # memory lives, so any future GPU fault address can be attributed without a dedicated job.
-    if env.is_main:
-        dump_mem_landmarks(model, dev, f"startup rank {env.rank}")
 
     total = args.max_steps or (60 if args.smoke else ocfg.total_steps)
     log_every = 10 if args.smoke else ocfg.log_every
@@ -322,41 +252,18 @@ def main():
     t_start, t_eval_total = time.perf_counter(), 0.0           # for the measured eval-overhead figure
     model.train()
 
-    def stage(name, shape):
-        """Diagnostic breadcrumb: see --sync-stages."""
-        if step - start_step < args.sync_stages:
-            _device_sync(dev)
-            print(f"[stage] rank {env.rank} step {step} {name} shape={shape}", file=sys.stderr, flush=True)
     while step < total:
         sampler.set_epoch(step)
         for batch in loader:
             batch = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in batch.items()}
-            shape = tuple(batch["tokens"].shape)
-            n_tok = batch["tokens"].numel()                    # canvas tokens processed this step (B*L)
-            stage("h2d", shape)
-            if args.mem_snapshot and step == args.mem_snapshot and env.is_main:
-                dump_mem_landmarks(model, dev, f"step {step} rank {env.rank}")
+            n_tok = batch["tokens"].numel()
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
                 loss, m = training_step(model, batch, p_uncond=ocfg.p_uncond,
                                         beta=ocfg.beta, sub_probs=sub_probs, beta_schedule=ocfg.beta_schedule,
                                         pad_loss_weight=ocfg.pad_loss_weight)
-            stage("forward", shape)
             loss.backward()
-            stage("backward", shape)
-            # Average BEFORE clipping: clipping first clips each rank's local gradient to grad_clip and
-            # then averages, which is not global-norm clipping and biases the step toward the ranks with
-            # the smallest gradients. Order matters at 192 ranks. The reduction also reports whether any
-            # rank produced a non-finite gradient, in-band, so no second collective is needed.
             nonfinite = average_gradients(model)
-            if args.drain_collectives:
-                barrier()
-            stage("allreduce", shape)
-            # A NaN/Inf gradient makes clip_grad_norm_'s coefficient NaN, so opt.step() would turn EVERY
-            # parameter NaN -- the run then burns node-hours on garbage and writes poisoned checkpoints.
-            # Skip the update instead; the next iteration's zero_grad discards the bad grads, and params
-            # and AdamW moments are untouched. Every rank read the same reduced flag, so the decision is
-            # unanimous and no rank can diverge into a hang.
             if nonfinite:
                 skipped += 1
                 skip_streak += 1
@@ -371,8 +278,7 @@ def main():
                 skip_streak = 0
                 torch.nn.utils.clip_grad_norm_(model.parameters(), ocfg.grad_clip)
                 opt.step()
-            sched.step()                                       # always: LR stays a function of `step`
-            stage("step", shape)
+            sched.step()
             tok_win += n_tok
             steps_win += 1
             if env.is_main and step % log_every == 0:
