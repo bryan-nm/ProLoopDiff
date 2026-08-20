@@ -39,6 +39,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 
 # --------------------------------------------------------------------------------------
@@ -66,6 +67,8 @@ class Config:
     n_pb_heads: int = 2               # heads for the in-PB cross-attention (16/2 = 8-d heads)
 
     text_dim: int = 768           # BiomedBERT-full hidden size (token-level embeddings)
+
+    grad_checkpoint: bool = True
 
     rope_base: float = 10000.0
     dropout: float = 0.0
@@ -380,10 +383,18 @@ class RecurrentOADM(nn.Module):
             x = l(x, keep_mask)
         h_up = x                                                # upstream output for re-injection
 
-        for _ in range(N):
+        def _recurrence_pass(x, h_up, keep_mask, te, gen_keep):
             x = x + torch.tanh(self.reinject_gate) * h_up
             for l in self.mid_layers:
                 x = l(x, keep_mask, te, gen_keep)
+            return x
+
+        for _ in range(N):
+            if cfg.grad_checkpoint and self.training:
+                x = torch_checkpoint(_recurrence_pass, x, h_up, keep_mask, te, gen_keep,
+                                     use_reentrant=False)
+            else:
+                x = _recurrence_pass(x, h_up, keep_mask, te, gen_keep)
 
         for l in self.down_layers:
             x = l(x, keep_mask)

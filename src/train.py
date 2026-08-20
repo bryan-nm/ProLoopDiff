@@ -26,9 +26,9 @@ from .data import (ProteinTokenizer, DummyTextEmbedder, HFTextEmbedder, CacheTex
                    load_swissprot, MixedProteinDataset, BucketedLengthSampler, make_collate)
 
 try:
+    import warnings as _w
+    _w.filterwarnings("ignore", message=".*split master weight.*")
     import intel_extension_for_pytorch as ipex
-    import logging as _logging
-    _logging.getLogger("intel_extension_for_pytorch").setLevel(_logging.WARNING)
 except Exception:
     ipex = None
 
@@ -147,17 +147,22 @@ def main():
     ap.add_argument("--no-ipex", action="store_true", help="skip ipex.optimize (eager XPU; robust to dynamic shapes)")
     ap.add_argument("--eval-every", type=int, default=None,
                     help="override opt.eval_every for the sampling eval (0 disables it)")
+    ap.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=None,
+                    help="override grad_checkpoint (default: model config, currently True)")
     args = ap.parse_args()
 
     env = init_distributed(args.device)
     dev = env.device
     torch.manual_seed(CFG.opt.seed + env.rank)
     mcfg, dcfg, ocfg = CFG.model_config(), CFG.data, CFG.opt
+    if args.grad_checkpoint is not None:
+        mcfg.grad_checkpoint = args.grad_checkpoint
 
     # --- model ---
     model = RecurrentOADM(mcfg).to(dev)
     if env.is_main:
-        print(f"[train] params={count_params(model)/1e6:.1f}M device={dev}", flush=True)
+        print(f"[train] params={count_params(model)/1e6:.1f}M device={dev} "
+              f"grad_checkpoint={mcfg.grad_checkpoint}", flush=True)
     broadcast_parameters(model)
     sub_probs = blosum_sub_probs(BLOSUM_MAT, temp=ocfg.blosum_temp).to(dev) \
         if os.path.exists(BLOSUM_MAT) else None
