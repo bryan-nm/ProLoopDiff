@@ -8,12 +8,49 @@
 #PBS -q debug
 #PBS -j oe
 
-# Recurrent-OADM protein generator training. Model/dataset paths are owned by config.py.
-# Submit with qsub from the repo root. The cd MUST precede the source (see pbs_common.sh).
+# Recurrent-OADM training + dedicated checkpoint evaluator. The last node runs src.eval (watches
+# for new checkpoints and samples from each); the remaining nodes run src.train. Both write to the
+# same PBS output stream -- [train]/[eval] prefixes distinguish them. Needs select >= 2.
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./scripts/pbs_common.sh
 
-job_banner "protein-gen training (src.train)"
+# --- split: last node evaluates checkpoints, rest train ---
+if [ "$NNODES" -lt 2 ]; then
+    echo "FATAL: need >=2 nodes to split train+eval (got $NNODES)." >&2
+    exit 1
+fi
 
-"${MPI_LAUNCH[@]}" python -m src.train --device xpu
-rc=$?; echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap in pbs_common reports the true code
+TRAIN_NODES=$((NNODES - 1))
+EVAL_NODES=1
+TRAIN_RANKS=$((TRAIN_NODES * RANKS_PER_NODE))
+EVAL_RANKS=$((EVAL_NODES * RANKS_PER_NODE))
+
+TRAIN_NODEFILE=$(mktemp)
+EVAL_NODEFILE=$(mktemp)
+head -n "$TRAIN_NODES" "$PBS_NODEFILE" > "$TRAIN_NODEFILE"
+tail -n "$EVAL_NODES" "$PBS_NODEFILE" > "$EVAL_NODEFILE"
+
+TRAIN_MASTER=$(head -n1 "$TRAIN_NODEFILE")
+EVAL_MASTER=$(head -n1 "$EVAL_NODEFILE")
+
+job_banner "protein-gen training + checkpoint eval" \
+    TRAIN_NODES TRAIN_RANKS EVAL_NODES EVAL_RANKS
+
+# --- eval watcher (background; killed when training finishes) ---
+MASTER_ADDR=$EVAL_MASTER MASTER_PORT=29501 \
+  mpiexec -n "$EVAL_RANKS" -ppn "$RANKS_PER_NODE" --pmi=pmix --cpu-bind depth -d 8 \
+  --hostfile "$EVAL_NODEFILE" \
+  python -m src.eval --device xpu &
+eval_pid=$!
+
+# --- training (foreground) ---
+MASTER_ADDR=$TRAIN_MASTER MASTER_PORT=29500 \
+  mpiexec -n "$TRAIN_RANKS" -ppn "$RANKS_PER_NODE" --pmi=pmix --cpu-bind depth -d 8 \
+  --hostfile "$TRAIN_NODEFILE" \
+  python -m src.train --device xpu
+rc=$?
+
+# training done; stop the eval watcher and clean up
+kill $eval_pid 2>/dev/null; wait $eval_pid 2>/dev/null
+rm -f "$TRAIN_NODEFILE" "$EVAL_NODEFILE"
+echo "[job] exit $rc"; exit $rc

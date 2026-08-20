@@ -1,0 +1,19 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N protgen_eval
+#PBS -l walltime=00:30:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug
+#PBS -j oe
+
+# Dedicated checkpoint evaluator: watches CKPT_DIR for new checkpoints and evaluates each one.
+# Submit alongside train.pbs. All 12 tiles sample independently for 12x the statistics.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+job_banner "protein-gen checkpoint evaluator (src.eval)"
+
+"${MPI_LAUNCH[@]}" python -m src.eval --device xpu
+rc=$?; echo "[job] exit $rc"; exit $rc

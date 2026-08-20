@@ -20,7 +20,6 @@ from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, ave
                    broadcast_checkpoint_bytes, preallocate_grad_buffer)
 from .recurrent_oadm import RecurrentOADM, count_params
 from .objective import training_step
-from .sampler import generate
 from .blosum import blosum_sub_probs
 from .data import (ProteinTokenizer, DummyTextEmbedder, HFTextEmbedder, CacheTextEmbedder, ProteinShards,
                    load_swissprot, MixedProteinDataset, BucketedLengthSampler, make_collate)
@@ -94,50 +93,6 @@ def _peak_mem_gb(dev):
     return 0.0
 
 
-# --- periodic generative eval -------------------------------------------------------------
-def _rng_snapshot(dev):
-    return torch.random.get_rng_state(), (torch.xpu.get_rng_state() if dev.type == "xpu" else
-                                          torch.cuda.get_rng_state() if dev.type == "cuda" else None)
-
-
-def _rng_restore(snap, dev):
-    cpu_state, dev_state = snap
-    torch.random.set_rng_state(cpu_state)
-    if dev_state is not None:
-        (torch.xpu if dev.type == "xpu" else torch.cuda).set_rng_state(dev_state)
-
-
-@torch.no_grad()
-def eval_sample_lengths(model, dev, n, canvas, steps, seed=1234):
-    """Sample `n` sequences unconditionally and report their length distribution.
-
-    Length is emergent here (the model decides by placing EOS), so it is the first generative
-    property worth watching and the loss curve cannot tell you about it. Returns
-    (mean, stdev, n_no_eos) where n_no_eos counts rows that never emitted EOS -- those come back as
-    the full canvas width, so without that count a "mean 512" is indistinguishable from a genuine
-    long-sequence distribution. Hook oracle metrics onto the returned tokens later.
-
-    RNG is snapshotted, fixed, and restored, which buys two things: the training stream is bit-identical
-    whether or not eval runs (so eval settings never perturb the trajectory), and every eval draws the
-    SAME decode noise, making the trend across checkpoints a paired comparison instead of a noisy one.
-
-    Every rank runs this and only rank 0 prints. Ranks would otherwise idle inside the next collective
-    while rank 0 sampled; doing it in lockstep costs the same wall time and avoids a 192-way straggler.
-    (Giving each rank its own seed and all-reducing the moments would widen the sample to n*world for
-    free, if tighter statistics are ever wanted.)
-    """
-    snap = _rng_snapshot(dev)
-    torch.manual_seed(seed)
-    try:
-        _, lengths = generate(model, Lmax=canvas, batch_size=n, text_emb=None, cfg_weight=0.0,
-                              n_steps=steps, temperature=1.0, gumbel_temp=0.1, greedy=False,
-                              device=str(dev))
-    finally:
-        _rng_restore(snap, dev)
-    lens = torch.tensor(lengths, dtype=torch.float32)
-    return lens.mean().item(), lens.std().item(), int((lens >= canvas).sum())
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default=CFG.device)
@@ -145,8 +100,6 @@ def main():
     ap.add_argument("--fresh", action="store_true", help="ignore any existing checkpoint and start from step 0")
     ap.add_argument("--max-steps", type=int, default=None, help="override total_steps (e.g. debug-queue validation)")
     ap.add_argument("--no-ipex", action="store_true", help="skip ipex.optimize (eager XPU; robust to dynamic shapes)")
-    ap.add_argument("--eval-every", type=int, default=None,
-                    help="override opt.eval_every for the sampling eval (0 disables it)")
     ap.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=None,
                     help="override grad_checkpoint (default: model config, currently True)")
     args = ap.parse_args()
@@ -249,14 +202,10 @@ def main():
 
     total = args.max_steps or (60 if args.smoke else ocfg.total_steps)
     log_every = 10 if args.smoke else ocfg.log_every
-    # Smoke runs on CPU, so shrink the eval to something that still exercises the whole path.
-    ev_every = args.eval_every if args.eval_every is not None else (20 if args.smoke else ocfg.eval_every)
-    ev_n, ev_canvas, ev_steps = (8, 128, 8) if args.smoke else (ocfg.eval_n, ocfg.eval_canvas, ocfg.eval_steps)
     use_amp = dev.type in ("xpu", "cuda")
     step = start_step
     tok_win, steps_win, t_win = 0, 0, time.perf_counter()      # throughput window (reset each log)
     skipped, skip_streak = 0, 0                                # non-finite-gradient updates dropped
-    t_start, t_eval_total = time.perf_counter(), 0.0           # for the measured eval-overhead figure
     model.train()
 
     while step < total:
@@ -302,18 +251,6 @@ def main():
                 tok_win, steps_win, t_win = 0, 0, time.perf_counter()
             if step > 0 and step % ocfg.ckpt_every == 0:
                 save_checkpoint(model, opt, sched, step, CKPT_DIR, env)
-            if ev_every and step > 0 and step % ev_every == 0:
-                t_ev = time.perf_counter()
-                with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
-                    mu, sd, n_no_eos = eval_sample_lengths(model, dev, ev_n, ev_canvas, ev_steps)
-                _device_sync(dev)
-                dt_ev = time.perf_counter() - t_ev
-                t_eval_total += dt_ev
-                t_win += dt_ev                                 # keep eval out of the tok/s window
-                if env.is_main:
-                    frac = 100 * t_eval_total / max(time.perf_counter() - t_start, 1e-9)
-                    print(f"[eval] step {step} | len mean {mu:.1f} sd {sd:.1f} | no-EOS "
-                          f"{n_no_eos}/{ev_n} | {dt_ev:.1f}s ({frac:.1f}% of wall so far)", flush=True)
             step += 1
             if step >= total:
                 break
