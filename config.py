@@ -44,7 +44,7 @@ class DataCfg:
     # bucket stays memory-safe. Both corpora are built to 30-500 aa, so the 1024 bucket is empty for the
     # current data (it would halve B and roughly double attention HBM) but is ready for later.
     # Length bucketing also keeps the PAD tail short (PAD is modelled+attended for EOS-length).
-    length_buckets: tuple = (128, 256, 384, 512, 1024)
+    length_buckets: tuple = (512,)
     # Mixed corpus: mostly TrEMBL, but oversample SwissProt so the text pathway sees signal.
     # p_swissprot is the probability a training example is drawn from the labelled (text) corpus.
     p_swissprot: float = 0.25

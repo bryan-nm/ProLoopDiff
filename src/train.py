@@ -27,6 +27,8 @@ from .data import (ProteinTokenizer, DummyTextEmbedder, HFTextEmbedder, CacheTex
 
 try:
     import intel_extension_for_pytorch as ipex
+    import logging as _logging
+    _logging.getLogger("intel_extension_for_pytorch").setLevel(_logging.WARNING)
 except Exception:
     ipex = None
 
