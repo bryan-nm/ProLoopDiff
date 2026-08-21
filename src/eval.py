@@ -131,12 +131,13 @@ def _lcr_counts(canvas, eos_id, window=12, threshold=2.2):
     return lcr_res, total_res
 
 
-def _decode_seqs(canvas, cfg, min_len):
+def _decode_seqs(canvas, cfg, min_len, max_len=None):
     """Canvas rows -> amino-acid strings, truncated at the first EOS/PAD.
 
     Only ids 0..19 map to residues; anything else (a MASK that survived decoding) is dropped.
-    Rows shorter than `min_len` are omitted -- ESMFold rejects empty input and a handful of
-    residues carries no foldable signal. Returns (sequences, n_skipped).
+    Rows outside [min_len, max_len] are OMITTED rather than clipped: ESMFold rejects empty input,
+    a handful of residues carries no foldable signal, and silently folding a clipped fragment
+    would report a pLDDT for a molecule that was never generated. Returns (sequences, n_skipped).
     """
     seqs, skipped = [], 0
     for row in canvas.cpu().tolist():
@@ -146,7 +147,7 @@ def _decode_seqs(canvas, cfg, min_len):
                 break
             if 0 <= t < len(AA):
                 out.append(AA[t])
-        if len(out) >= min_len:
+        if len(out) >= min_len and (max_len is None or len(out) <= max_len):
             seqs.append("".join(out))
         else:
             skipped += 1
@@ -222,10 +223,16 @@ def natural_baselines(sp_rows, cfg, n, canvas_width, env, dev, seed=42):
     if total == 0:
         return None
 
+    # Only sequences that FIT the canvas. SwissProt is not length-filtered upstream -- the single
+    # 512 bucket clips every length into itself -- so without this the baseline silently folds a
+    # 512-residue FRAGMENT of each large protein and calls it "natural", which is both a
+    # meaningless structure and an unfairly low reference for the model to be compared against.
+    eligible = [i for i, r in enumerate(sp_rows) if len(r[1]) <= canvas_width]
+
     # Each rank takes a strided slice, up to n sequences. A rank whose slice comes out EMPTY
     # (fewer rows than ranks) must NOT return early -- it still has to enter the all_reduce below
     # or the ranks that do have work block there until the job hits its walltime.
-    indices = list(range(env.rank, total, max(env.world_size, 1)))[:n]
+    indices = eligible[env.rank::max(env.world_size, 1)][:n]
     seqs = [sp_rows[i][1] for i in indices]  # ids lists (AA... EOS)
 
     canvas = _pack_canvas(seqs, cfg.pad_token_id, canvas_width)
@@ -293,6 +300,12 @@ def main():
                     help="sequences folded per rank per eval (default: config fold_n; 0 disables)")
     ap.add_argument("--esmfold-weights", default=ESMFOLD_WEIGHTS,
                     help="ESMFold2-Fast weights directory or HF hub id")
+    ap.add_argument("--fold-max-len", type=int, default=None,
+                    help="skip sequences longer than this when folding (default: config fold_max_len)")
+    ap.add_argument("--once", action="store_true",
+                    help="run the baselines, evaluate the latest checkpoint if one exists, then "
+                         "EXIT instead of watching. For debug-queue bisection runs, which would "
+                         "otherwise sit in the poll loop until walltime.")
     args = ap.parse_args()
 
     env = init_distributed(args.device)
@@ -341,6 +354,7 @@ def main():
     ev_canvas = args.eval_canvas or ocfg.eval_canvas
     ev_steps = args.eval_steps or ocfg.eval_steps
     fold_n = ocfg.fold_n if args.fold_n is None else args.fold_n
+    fold_max_len = args.fold_max_len or ocfg.fold_max_len
     use_amp = dev.type in ("xpu", "cuda")
     ckpt_dir = args.ckpt_dir
 
@@ -420,7 +434,7 @@ def main():
                       f"natural {nat_frac:.1%}, shuffled {shuf_frac:.1%}", flush=True)
             if scorer is not None:
                 for label, cv in (("natural", nat_canvas), ("shuffled", shuf_canvas)):
-                    seqs, n_skip = _decode_seqs(cv[:fold_n], mcfg, ocfg.fold_min_len)
+                    seqs, n_skip = _decode_seqs(cv[:fold_n], mcfg, ocfg.fold_min_len, fold_max_len)
                     m = fold_stats(seqs, scorer, env, dev, ocfg, n_skip)
                     if env.is_main:
                         print(f"[eval] fold baseline {label:>8} | {_fold_line(m, ocfg)}", flush=True)
@@ -432,11 +446,15 @@ def main():
         if ckpt_path is None:
             if env.is_main and not evaluated:
                 print(f"[eval] waiting for first checkpoint in {ckpt_dir}...", flush=True)
+            if args.once:
+                break
             time.sleep(args.poll)
             continue
 
         step = _parse_step(ckpt_path)
         if step in evaluated:
+            if args.once:
+                break
             time.sleep(args.poll)
             continue
 
@@ -464,15 +482,19 @@ def main():
         # Fold OUTSIDE the bf16 autocast: the scorer manages its own dtypes (and on XPU patches
         # F.linear to match weights), so an enclosing autocast would fight it.
         if scorer is not None:
-            seqs, n_skip = _decode_seqs(gen[:fold_n], mcfg, ocfg.fold_min_len)
+            seqs, n_skip = _decode_seqs(gen[:fold_n], mcfg, ocfg.fold_min_len, fold_max_len)
             m = fold_stats(seqs, scorer, env, dev, ocfg, n_skip)
             if env.is_main:
                 print(f"[eval] step {ck_step} | {_fold_line(m, ocfg)}", flush=True)
         del gen
 
         evaluated.add(step)
+        if args.once:
+            break
         time.sleep(args.poll)
 
+    if env.is_main:
+        print(f"[eval] done ({len(evaluated)} checkpoint(s) evaluated)", flush=True)
     barrier()
     cleanup()
 

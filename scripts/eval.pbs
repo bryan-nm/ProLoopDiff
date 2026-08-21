@@ -8,12 +8,26 @@
 #PBS -q debug
 #PBS -j oe
 
-# Dedicated checkpoint evaluator: watches CKPT_DIR for new checkpoints and evaluates each one.
-# Submit alongside train.pbs. All 12 tiles sample independently for 12x the statistics.
+# Standalone checkpoint evaluator: watches CKPT_DIR and evaluates each new checkpoint.
+# Also the bisection harness for fold-time GPU faults -- both knobs below are qsub -v overrides:
+#
+#   qsub -v RANKS_PER_NODE=1,EVAL_ARGS="--once" scripts/eval.pbs
+#       ONE process, so dist.init_distributed returns before init_process_group and oneCCL is
+#       never initialised. This is the configuration EsmFold's speed_test.pbs actually validated;
+#       if it passes and 12 ranks faults, the fault is in the CCL/multi-rank interaction, not in
+#       ESMFold or in the sequences being folded.
+#
+#   qsub -v EVAL_ARGS="--once --fold-max-len 300" scripts/eval.pbs
+#       Caps folded length to the speed test's validated range (63-297 aa).
+#
+#   qsub -v PYTORCH_DEBUG_XPU_FALLBACK=1,RANKS_PER_NODE=1,EVAL_ARGS="--once" scripts/eval.pbs
+#       Names any aten op silently falling back XPU->CPU. Per the EsmFold README a NEW fallback
+#       reintroduces exactly the "Segmentation fault from GPU" this is chasing.
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./scripts/pbs_common.sh
 
-job_banner "protein-gen checkpoint evaluator (src.eval)"
+job_banner "protein-gen checkpoint evaluator (src.eval)" RANKS_PER_NODE EVAL_ARGS
 
-"${MPI_LAUNCH[@]}" python -m src.eval --device xpu
+# shellcheck disable=SC2086  # EVAL_ARGS is deliberately word-split into separate flags
+"${MPI_LAUNCH[@]}" python -m src.eval --device xpu ${EVAL_ARGS:-}
 rc=$?; echo "[job] exit $rc"; exit $rc

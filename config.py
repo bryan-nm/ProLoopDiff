@@ -100,6 +100,12 @@ class OptCfg:
     # 100*world sequences of statistics. 0 disables folding.
     fold_n: int = 100                    # sequences folded per rank per eval round
     fold_min_len: int = 10               # skip shorter generations; too short to fold meaningfully
+    # Upper length bound on what gets folded. ESMFold's pair tensors are ~L^2, and the EsmFold
+    # speed test only ever validated 63-297 aa; this is the knob to pull when a longer input is
+    # suspected in a fold-time GPU fault. It also bounds the natural baseline, whose sequences come
+    # straight from SwissProt and are NOT length-filtered upstream (the single 512 bucket clips
+    # every length into itself, so the CSV holds proteins far longer than the canvas).
+    fold_max_len: int = 512
     # DO NOT lower fold_steps below 20: pLDDT does not degrade gracefully, it collapses to the
     # ~0.25 no-information floor between 10 and 20 steps, which would silently look like a metric.
     fold_steps: int = 20                 # ESMFold2 diffusion sampling steps
