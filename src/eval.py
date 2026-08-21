@@ -302,6 +302,12 @@ def main():
                     help="ESMFold2-Fast weights directory or HF hub id")
     ap.add_argument("--fold-max-len", type=int, default=None,
                     help="skip sequences longer than this when folding (default: config fold_max_len)")
+    ap.add_argument("--baselines", default="natural,shuffled",
+                    help="which fold baselines to run, comma-separated ('natural', 'shuffled', or "
+                         "'none'). Running 'shuffled' ALONE is the test that separates a "
+                         "degenerate-input fault from one caused by state accumulated over a "
+                         "preceding batch: if shuffled faults as the FIRST fold, the input is "
+                         "the trigger.")
     ap.add_argument("--once", action="store_true",
                     help="run the baselines, evaluate the latest checkpoint if one exists, then "
                          "EXIT instead of watching. For debug-queue bisection runs, which would "
@@ -433,7 +439,10 @@ def main():
                 print(f"[eval] LCR baselines ({n_bl} SwissProt seqs): "
                       f"natural {nat_frac:.1%}, shuffled {shuf_frac:.1%}", flush=True)
             if scorer is not None:
+                want = {s.strip() for s in args.baselines.split(",")} - {"", "none"}
                 for label, cv in (("natural", nat_canvas), ("shuffled", shuf_canvas)):
+                    if label not in want:
+                        continue
                     seqs, n_skip = _decode_seqs(cv[:fold_n], mcfg, ocfg.fold_min_len, fold_max_len)
                     m = fold_stats(seqs, scorer, env, dev, ocfg, n_skip)
                     if env.is_main:

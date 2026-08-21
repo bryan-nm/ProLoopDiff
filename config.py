@@ -117,13 +117,13 @@ class OptCfg:
     # makes good secondary structure and no real fold. 0.5 is the usual "topology likely correct"
     # line. Reported on the native 0-1 scale (unlike pLDDT, pTM has no 0-100 convention).
     ptm_confident: float = 0.50
-    # The scorer defaults to empty_cache_every=1 (release cached HBM after EVERY sequence). That is
-    # right for a standalone single-process run, but here oneCCL collectives share the tile:
-    # empty_cache returns blocks to the L0 driver and UNMAPS them, and any CCL registration still
-    # cached for such a block then faults as "NotPresent PTE". 0 disables it. The eval script's own
-    # all-reduce buffer is preallocated and stays live, so it is immune either way -- raise this
-    # only if long sequences start fragmenting HBM (the failure would be an OOM-ish fault mid-fold).
-    fold_empty_cache_every: int = 0
+    # Release cached HBM every N folded sequences (0 disables). Keep this at the library default
+    # of 1. It was briefly set to 0 on the theory that empty_cache was unmapping blocks under
+    # oneCCL's cached registrations; a single-rank run with NO process group at all still faulted,
+    # which disproved that. Meanwhile the EsmFold README warns that NOT clearing the cache lets a
+    # long, length-varied batch fragment HBM, "which on Aurora XPU manifests as a GPU page fault
+    # rather than a clean OOM" -- i.e. setting this to 0 buys a failure mode instead of avoiding one.
+    fold_empty_cache_every: int = 1
     # bookkeeping
     log_every: int = 50
     ckpt_every: int = 1000               # ~14min at scale; crashes are common on many tiles, so save often

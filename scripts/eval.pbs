@@ -17,6 +17,12 @@
 #       if it passes and 12 ranks faults, the fault is in the CCL/multi-rank interaction, not in
 #       ESMFold or in the sequences being folded.
 #
+#   qsub -v RANKS_PER_NODE=1,EVAL_ARGS="--once --baselines shuffled" scripts/eval.pbs
+#       Folds ONLY the scrambled baseline, as the first and only batch. Scrambled sequences are
+#       the pathological input for a structure predictor, and they fault where the natural ones
+#       of identical length and composition do not. If this faults immediately the trigger is the
+#       INPUT; if it passes, the trigger was state carried over from the preceding batch.
+#
 #   qsub -v EVAL_ARGS="--once --fold-max-len 300" scripts/eval.pbs
 #       Caps folded length to the speed test's validated range (63-297 aa).
 #
