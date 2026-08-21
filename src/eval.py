@@ -54,6 +54,43 @@ def _device_sync(dev):
         torch.cuda.synchronize()
 
 
+# --- one persistent all-reduce buffer for EVERY collective this script runs -------------------
+# Same hard-won reasoning as dist.preallocate_grad_buffer, which eval originally did not inherit.
+# oneCCL caches L0 registrations keyed by POINTER. A stats tensor built per call is freed the
+# moment the function returns, so CCL is left holding a registration for a block the allocator has
+# taken back -- and ESMFold calls torch.xpu.empty_cache() between collectives, which returns such
+# blocks to the DRIVER and unmaps them. The next collective then reads an unmapped page, which is
+# exactly "Segmentation fault from GPU ... type: 0 (NotPresent), level: 0 (PTE)".
+#
+# One buffer, allocated once on a clean heap before ESMFold loads, reduced at a FIXED size every
+# time: CCL sees exactly one (pointer, count) pair for the life of the run, and because the tensor
+# stays live, empty_cache() can never unmap it.
+_STATS_N = 16
+_STATS_BUF = None
+
+
+def preallocate_stats_buffer(dev):
+    global _STATS_BUF
+    _STATS_BUF = torch.zeros(_STATS_N, dtype=torch.float32, device=dev)
+    return _STATS_BUF.numel()
+
+
+def allreduce_stats(values, env, dev):
+    """Sum `values` (a short list of scalars) across ranks; returns them as a list of floats."""
+    global _STATS_BUF
+    if len(values) > _STATS_N:
+        raise ValueError(f"allreduce_stats takes at most {_STATS_N} values, got {len(values)}")
+    if _STATS_BUF is None or _STATS_BUF.device != dev:
+        preallocate_stats_buffer(dev)
+    buf = _STATS_BUF
+    buf.zero_()
+    for i, v in enumerate(values):
+        buf[i] = v
+    if env.distributed:
+        torch.distributed.all_reduce(buf)      # ALWAYS the full buffer: one fixed shape for CCL
+    return buf[:len(values)].tolist()
+
+
 def _lcr_counts(canvas, eos_id, window=12, threshold=2.2):
     """Count residue positions inside low-complexity windows (SEG-like sliding-window entropy).
 
@@ -130,30 +167,24 @@ def fold_stats(seqs, scorer, env, dev, ocfg, n_skipped=0):
         res = scorer.score(seqs, num_sampling_steps=ocfg.fold_steps, num_loops=ocfg.fold_loops)
         plddt, ptm = res.per_sequence_plddt, res.per_sequence_ptm
 
-    def _vec(v):
-        return torch.tensor(v, dtype=torch.float32, device=dev) if v else \
-            torch.zeros(0, dtype=torch.float32, device=dev)
+    # Reduced on the HOST side: these are short Python lists, so there is no reason to put another
+    # transient device tensor in front of oneCCL (see the allreduce_stats note above).
+    n_p, sum_p = len(plddt), float(sum(plddt))
+    conf_p = float(sum(1 for v in plddt if v > ocfg.plddt_confident))
+    sum_t = float(sum(ptm))
+    conf_t = float(sum(1 for v in ptm if v > ocfg.ptm_confident))
 
-    p, t = _vec(plddt), _vec(ptm)
-    stats = torch.zeros(6, device=dev)
-    stats[0] = p.numel()
-    stats[1] = p.sum()
-    stats[2] = (p > ocfg.plddt_confident).sum()
-    stats[3] = t.sum()
-    stats[4] = (t > ocfg.ptm_confident).sum()
-    stats[5] = n_skipped
+    n_f, sum_p, conf_p, sum_t, conf_t, skipped = allreduce_stats(
+        [n_p, sum_p, conf_p, sum_t, conf_t, float(n_skipped)], env, dev)
 
-    if env.distributed:
-        torch.distributed.all_reduce(stats)
-
-    n = int(stats[0].item())
+    n = int(n_f)
     return {
-        "plddt": 100.0 * stats[1].item() / max(n, 1),   # 0-1 scale -> AlphaFold 0-100
-        "plddt_conf": stats[2].item() / max(n, 1),
-        "ptm": stats[3].item() / max(n, 1),             # native 0-1
-        "ptm_conf": stats[4].item() / max(n, 1),
+        "plddt": 100.0 * sum_p / max(n, 1),             # 0-1 scale -> AlphaFold 0-100
+        "plddt_conf": conf_p / max(n, 1),
+        "ptm": sum_t / max(n, 1),                       # native 0-1
+        "ptm_conf": conf_t / max(n, 1),
         "n": n,
-        "skipped": int(stats[5].item()),
+        "skipped": int(skipped),
         "seconds": time.perf_counter() - t0,
     }
 
@@ -211,23 +242,15 @@ def natural_baselines(sp_rows, cfg, n, canvas_width, env, dev, seed=42):
     canvas_shuf = _pack_canvas(shuffled_seqs, cfg.pad_token_id, canvas_width)
     shuf_lcr, shuf_total = _lcr_counts(canvas_shuf, cfg.eos_token_id)
 
-    stats = torch.zeros(4, device=dev)
-    stats[0] = nat_lcr
-    stats[1] = nat_total
-    stats[2] = shuf_lcr
-    stats[3] = shuf_total
+    # One collective for all five figures (the sequence count rode in its own all_reduce before,
+    # which was a second transient buffer for CCL to cache and the allocator to recycle).
+    nat_lcr, nat_total, shuf_lcr, shuf_total, n_seqs = allreduce_stats(
+        [float(nat_lcr), float(nat_total), float(shuf_lcr), float(shuf_total),
+         float(len(indices))], env, dev)
 
-    if env.distributed:
-        torch.distributed.all_reduce(stats)
-
-    nat_frac = stats[0].item() / max(stats[1].item(), 1)
-    shuf_frac = stats[2].item() / max(stats[3].item(), 1)
-    n_seqs = len(indices)
-    if env.distributed:
-        n_buf = torch.tensor([n_seqs], dtype=torch.long, device=dev)
-        torch.distributed.all_reduce(n_buf)
-        n_seqs = int(n_buf.item())
-    return nat_frac, shuf_frac, n_seqs, canvas, canvas_shuf
+    nat_frac = nat_lcr / max(nat_total, 1)
+    shuf_frac = shuf_lcr / max(shuf_total, 1)
+    return nat_frac, shuf_frac, int(n_seqs), canvas, canvas_shuf
 
 
 def run_eval(model, dev, n_per_rank, canvas, steps, env, cfg, seed=1234):
@@ -237,26 +260,21 @@ def run_eval(model, dev, n_per_rank, canvas, steps, env, cfg, seed=1234):
     tokens, lengths = generate(model, Lmax=canvas, batch_size=n_per_rank, text_emb=None, cfg_weight=0.0,
                                n_steps=steps, temperature=1.0, gumbel_temp=0.1, greedy=False,
                                device=str(dev))
-    lens = torch.tensor(lengths, dtype=torch.float32, device=dev)
     lcr_res, total_res = _lcr_counts(tokens, cfg.eos_token_id)
+    n_l = len(lengths)
+    s1 = float(sum(lengths))
+    s2 = float(sum(v * v for v in lengths))
+    n_full = float(sum(1 for v in lengths if v >= canvas))
 
-    stats = torch.zeros(6, device=dev)
-    stats[0] = len(lengths)
-    stats[1] = lens.sum()
-    stats[2] = (lens ** 2).sum()
-    stats[3] = (lens >= canvas).sum()
-    stats[4] = lcr_res
-    stats[5] = total_res
+    n_total, s1, s2, n_full, lcr_res, total_res = allreduce_stats(
+        [float(n_l), s1, s2, n_full, float(lcr_res), float(total_res)], env, dev)
 
-    if env.distributed:
-        torch.distributed.all_reduce(stats)
-
-    n_total = int(stats[0].item())
-    mean = stats[1].item() / max(n_total, 1)
-    var = stats[2].item() / max(n_total, 1) - mean ** 2
+    n_total = int(n_total)
+    mean = s1 / max(n_total, 1)
+    var = s2 / max(n_total, 1) - mean ** 2
     sd = var ** 0.5 if var > 0 else 0.0
-    lcr_frac = stats[4].item() / max(stats[5].item(), 1)
-    return mean, sd, int(stats[3].item()), n_total, lcr_frac, tokens
+    lcr_frac = lcr_res / max(total_res, 1)
+    return mean, sd, int(n_full), n_total, lcr_frac, tokens
 
 
 def main():
@@ -281,14 +299,24 @@ def main():
     dev = env.device
     mcfg, ocfg = CFG.model_config(), CFG.opt
 
-    # The scorer logs model load + XPU patch details at INFO. Useful once, x12 ranks it is noise --
-    # keep rank 0 (the patch lines are worth seeing after an esm/torch upgrade) and quiet the rest.
-    # Only this logger's level is touched: calling basicConfig here would raise the ROOT level and
-    # could switch ON other libraries' INFO output instead of reducing anything. A genuine load
-    # failure is unaffected -- that is caught and printed explicitly below.
+    # Keep the scorer's INFO (model load, XPU patch lines) and esm's kernel-fallback WARNINGs on
+    # rank 0 only -- they are worth reading once after an esm/torch upgrade, but x12 ranks they
+    # bury the actual eval output. The esm config FutureWarnings are Python warnings, not logging,
+    # so they need the warnings filter as well. Only these named loggers are touched: calling
+    # basicConfig would raise the ROOT level and could switch ON other libraries' INFO instead of
+    # reducing anything. A genuine scorer load failure is unaffected -- that is caught and printed
+    # explicitly below, on every rank.
     if not env.is_main:
         import logging
+        import warnings
         logging.getLogger("esmfold_scorer").setLevel(logging.WARNING)
+        logging.getLogger("esm").setLevel(logging.ERROR)
+        warnings.filterwarnings("ignore", category=FutureWarning, module=r"esm\..*")
+        warnings.filterwarnings("ignore", message=".*Disabling autocast.*")
+
+    # BEFORE anything else touches the allocator, so CCL's one cached registration is for a block
+    # taken from a clean heap and held for the life of the run. See allreduce_stats.
+    preallocate_stats_buffer(dev)
 
     model = RecurrentOADM(mcfg).to(dev)
     model.eval()
@@ -298,6 +326,16 @@ def main():
     if env.is_main:
         print(f"[eval] params={count_params(model)/1e6:.1f}M device={dev} "
               f"ipex={applied_ipex} world={env.world_size}", flush=True)
+        # Versions, so an eval log can be diffed against EsmFold's speed_test banner: that test is
+        # the known-good reference, and it ran in a DIFFERENT venv (esmfold-env). A version skew
+        # here is a first thing to rule out when folding behaves differently than it did there.
+        def _ver(mod):
+            try:
+                return __import__(mod).__version__
+            except Exception:
+                return "n/a"
+        print(f"[eval] torch={torch.__version__} ipex={_ver('intel_extension_for_pytorch')} "
+              f"transformers={_ver('transformers')} esm={_ver('esm')}", flush=True)
 
     ev_n = args.eval_n or ocfg.eval_n
     ev_canvas = args.eval_canvas or ocfg.eval_canvas
@@ -334,7 +372,17 @@ def main():
                 torch.cuda.set_device(dev.index)
             scorer = StructureScorer(args.esmfold_weights, device=dev.type,
                                      num_sampling_steps=ocfg.fold_steps,
-                                     num_loops=ocfg.fold_loops, num_diffusion_samples=1)
+                                     num_loops=ocfg.fold_loops, num_diffusion_samples=1,
+                                     empty_cache_every=ocfg.fold_empty_cache_every)
+            # EVERY rank reports its own resident footprint, once. The scorer is handed a bare
+            # "xpu" device, so it lands on whatever the CURRENT device is -- if that pinning ever
+            # breaks, all 12 ranks load their own 12.3GiB copy onto tile 0 and the node dies with a
+            # GPU fault that looks nothing like an OOM. ~12GiB on each rank's OWN index proves the
+            # pinning held; 12 lines once per run is cheap next to debugging that from a page fault.
+            resident = (torch.xpu.memory_allocated(dev) / 1024**3 if dev.type == "xpu" else
+                        torch.cuda.memory_allocated(dev) / 1024**3 if dev.type == "cuda" else 0.0)
+            print(f"[eval] rank {env.rank:>3} loaded ESMFold on {dev} | {resident:.1f}GiB resident",
+                  flush=True)
             if env.is_main:
                 print(f"[eval] ESMFold2-Fast loaded in {time.perf_counter() - t_load:.1f}s from "
                       f"{args.esmfold_weights} | folding {fold_n}/rank x {env.world_size} = "
