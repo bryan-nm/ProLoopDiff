@@ -19,11 +19,12 @@ import time
 import argparse
 import torch
 
-from config import CFG, CKPT_DIR, SWISSPROT_CSV
+from config import CFG, CKPT_DIR, SWISSPROT_CSV, ESMFOLD_WEIGHTS
 from .dist import init_distributed, broadcast_checkpoint_bytes, barrier, cleanup
 from .recurrent_oadm import RecurrentOADM, count_params
 from .sampler import generate
 from .data import ProteinTokenizer, load_swissprot
+from .blosum import AA                      # canonical 20-AA alphabet, id == index
 
 try:
     import warnings as _w
@@ -93,6 +94,77 @@ def _lcr_counts(canvas, eos_id, window=12, threshold=2.2):
     return lcr_res, total_res
 
 
+def _decode_seqs(canvas, cfg, min_len):
+    """Canvas rows -> amino-acid strings, truncated at the first EOS/PAD.
+
+    Only ids 0..19 map to residues; anything else (a MASK that survived decoding) is dropped.
+    Rows shorter than `min_len` are omitted -- ESMFold rejects empty input and a handful of
+    residues carries no foldable signal. Returns (sequences, n_skipped).
+    """
+    seqs, skipped = [], 0
+    for row in canvas.cpu().tolist():
+        out = []
+        for t in row:
+            if t == cfg.eos_token_id or t == cfg.pad_token_id:
+                break
+            if 0 <= t < len(AA):
+                out.append(AA[t])
+        if len(out) >= min_len:
+            seqs.append("".join(out))
+        else:
+            skipped += 1
+    return seqs, skipped
+
+
+def fold_stats(seqs, scorer, env, dev, ocfg, n_skipped=0):
+    """Fold `seqs` with ESMFold2-Fast and all-reduce the pLDDT / pTM statistics.
+
+    Every rank folds its OWN sequences concurrently on its own tile -- ESMFold2 scores one
+    sequence at a time, so per-rank parallelism is the only parallelism available (see the
+    EsmFold README). Both scores come back on a 0-1 scale; pLDDT is reported on AlphaFold's
+    0-100 convention, pTM on its native 0-1. Returns a dict of the aggregated metrics.
+    """
+    t0 = time.perf_counter()
+    plddt, ptm = [], []
+    if seqs:                                    # a rank with nothing to fold still joins the collective
+        res = scorer.score(seqs, num_sampling_steps=ocfg.fold_steps, num_loops=ocfg.fold_loops)
+        plddt, ptm = res.per_sequence_plddt, res.per_sequence_ptm
+
+    def _vec(v):
+        return torch.tensor(v, dtype=torch.float32, device=dev) if v else \
+            torch.zeros(0, dtype=torch.float32, device=dev)
+
+    p, t = _vec(plddt), _vec(ptm)
+    stats = torch.zeros(6, device=dev)
+    stats[0] = p.numel()
+    stats[1] = p.sum()
+    stats[2] = (p > ocfg.plddt_confident).sum()
+    stats[3] = t.sum()
+    stats[4] = (t > ocfg.ptm_confident).sum()
+    stats[5] = n_skipped
+
+    if env.distributed:
+        torch.distributed.all_reduce(stats)
+
+    n = int(stats[0].item())
+    return {
+        "plddt": 100.0 * stats[1].item() / max(n, 1),   # 0-1 scale -> AlphaFold 0-100
+        "plddt_conf": stats[2].item() / max(n, 1),
+        "ptm": stats[3].item() / max(n, 1),             # native 0-1
+        "ptm_conf": stats[4].item() / max(n, 1),
+        "n": n,
+        "skipped": int(stats[5].item()),
+        "seconds": time.perf_counter() - t0,
+    }
+
+
+def _fold_line(m, ocfg):
+    """One-line rendering of a fold_stats result."""
+    return (f"pLDDT {m['plddt']:.1f} (>{ocfg.plddt_confident * 100:.0f}: {m['plddt_conf']:.1%}) | "
+            f"pTM {m['ptm']:.3f} (>{ocfg.ptm_confident:.2f}: {m['ptm_conf']:.1%}) | "
+            f"n={m['n']} skipped={m['skipped']} | {m['seconds']:.1f}s")
+
+
 def _pack_canvas(id_lists, pad_id, canvas_width):
     """Pack variable-length token lists into a (B, canvas_width) tensor, right-padded."""
     B = len(id_lists)
@@ -103,22 +175,27 @@ def _pack_canvas(id_lists, pad_id, canvas_width):
     return canvas
 
 
-def lcr_baselines(sp_rows, cfg, n, canvas_width, env, dev, seed=42):
-    """LCR on natural SwissProt sequences and their per-sequence shuffles.
+def natural_baselines(sp_rows, cfg, n, canvas_width, env, dev, seed=42):
+    """Build the natural / shuffled reference canvases and their LCR fractions.
 
-    Each rank draws a distinct strided slice of SwissProt so the baselines cover more of the
-    dataset. Statistics are all-reduced the same way as the generative eval.
+    Natural SwissProt sequences are the best case; per-sequence shuffles preserve each
+    sequence's exact AA composition while destroying its order, which is the right control for
+    both metrics -- it isolates "is the ORDER meaningful" from "is the composition plausible".
+
+    Each rank draws a distinct strided slice so the baselines cover more of the dataset.
+    Returns (nat_lcr, shuf_lcr, n_seqs, nat_canvas, shuf_canvas); the canvases are handed to
+    the folding pass so the sequences are decoded exactly once.
     """
     torch.manual_seed(seed + env.rank)
     total = len(sp_rows)
     if total == 0:
         return None
 
-    # each rank takes a strided slice, up to n sequences
+    # Each rank takes a strided slice, up to n sequences. A rank whose slice comes out EMPTY
+    # (fewer rows than ranks) must NOT return early -- it still has to enter the all_reduce below
+    # or the ranks that do have work block there until the job hits its walltime.
     indices = list(range(env.rank, total, max(env.world_size, 1)))[:n]
     seqs = [sp_rows[i][1] for i in indices]  # ids lists (AA... EOS)
-    if not seqs:
-        return None
 
     canvas = _pack_canvas(seqs, cfg.pad_token_id, canvas_width)
     nat_lcr, nat_total = _lcr_counts(canvas, cfg.eos_token_id)
@@ -150,7 +227,7 @@ def lcr_baselines(sp_rows, cfg, n, canvas_width, env, dev, seed=42):
         n_buf = torch.tensor([n_seqs], dtype=torch.long, device=dev)
         torch.distributed.all_reduce(n_buf)
         n_seqs = int(n_buf.item())
-    return nat_frac, shuf_frac, n_seqs
+    return nat_frac, shuf_frac, n_seqs, canvas, canvas_shuf
 
 
 def run_eval(model, dev, n_per_rank, canvas, steps, env, cfg, seed=1234):
@@ -179,7 +256,7 @@ def run_eval(model, dev, n_per_rank, canvas, steps, env, cfg, seed=1234):
     var = stats[2].item() / max(n_total, 1) - mean ** 2
     sd = var ** 0.5 if var > 0 else 0.0
     lcr_frac = stats[4].item() / max(stats[5].item(), 1)
-    return mean, sd, int(stats[3].item()), n_total, lcr_frac
+    return mean, sd, int(stats[3].item()), n_total, lcr_frac, tokens
 
 
 def main():
@@ -194,6 +271,10 @@ def main():
                     help="canvas width for sampling (default: config eval_canvas)")
     ap.add_argument("--eval-steps", type=int, default=None,
                     help="decoding steps (default: config eval_steps)")
+    ap.add_argument("--fold-n", type=int, default=None,
+                    help="sequences folded per rank per eval (default: config fold_n; 0 disables)")
+    ap.add_argument("--esmfold-weights", default=ESMFOLD_WEIGHTS,
+                    help="ESMFold2-Fast weights directory or HF hub id")
     args = ap.parse_args()
 
     env = init_distributed(args.device)
@@ -212,6 +293,7 @@ def main():
     ev_n = args.eval_n or ocfg.eval_n
     ev_canvas = args.eval_canvas or ocfg.eval_canvas
     ev_steps = args.eval_steps or ocfg.eval_steps
+    fold_n = ocfg.fold_n if args.fold_n is None else args.fold_n
     use_amp = dev.type in ("xpu", "cuda")
     ckpt_dir = args.ckpt_dir
 
@@ -222,18 +304,71 @@ def main():
               f"{ev_n} samples/rank x {env.world_size} ranks = {ev_n * env.world_size} total, "
               f"canvas={ev_canvas}, steps={ev_steps})", flush=True)
 
-    # --- LCR baselines from natural sequences (before first checkpoint) ---
+    # --- structural scorer (ESMFold2-Fast). Built ONCE: ~30s load, ~12.3GiB resident. ---
+    # NOTE: on XPU the scorer installs process-global monkey-patches on torch.linalg.svd/det and
+    # F.linear/F.layer_norm (see the EsmFold README). They are no-ops outside the cases they
+    # target, and this is the eval process only -- training runs under a separate mpiexec launch.
+    scorer, load_err = None, None
+    if fold_n > 0:
+        try:
+            from esmfold_scorer import StructureScorer
+            t_load = time.perf_counter()
+            # Pass the BARE device type ("xpu"), not str(dev) ("xpu:0"): the scorer's
+            # resolve_device() only accepts bare names and raises ValueError on an indexed one.
+            # An unindexed torch.device resolves to the CURRENT device, which dist._pick_device
+            # already pinned to this rank's tile via torch.xpu.set_device -- re-asserted here so
+            # each of the 12 ranks loads its own 12.3GiB copy onto its own tile rather than all
+            # piling onto tile 0.
+            if dev.type == "xpu" and dev.index is not None:
+                torch.xpu.set_device(dev.index)
+            elif dev.type == "cuda" and dev.index is not None:
+                torch.cuda.set_device(dev.index)
+            scorer = StructureScorer(args.esmfold_weights, device=dev.type,
+                                     num_sampling_steps=ocfg.fold_steps,
+                                     num_loops=ocfg.fold_loops, num_diffusion_samples=1)
+            if env.is_main:
+                print(f"[eval] ESMFold2-Fast loaded in {time.perf_counter() - t_load:.1f}s from "
+                      f"{args.esmfold_weights} | folding {fold_n}/rank x {env.world_size} = "
+                      f"{fold_n * env.world_size} seqs/round at {ocfg.fold_steps} steps", flush=True)
+        except Exception as ex:
+            scorer, load_err = None, f"{type(ex).__name__}: {ex}"
+            print(f"[eval] rank {env.rank}: ESMFold scorer failed to load ({load_err})", flush=True)
+
+        # Make the decision UNANIMOUS. Folding is collective (fold_stats all-reduces), so a rank
+        # that quietly skipped it would leave every other rank blocked in that collective until
+        # the job hit its walltime. If ANY rank failed to load, all of them disable folding.
+        if env.distributed:
+            ok = torch.tensor([1.0 if scorer is not None else 0.0], device=dev)
+            torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN)
+            if ok.item() == 0.0 and scorer is not None:
+                scorer = None
+        if scorer is None and env.is_main:
+            print(f"[eval] WARNING: ESMFold unavailable on at least one rank; "
+                  f"pLDDT reporting disabled for the whole run.", flush=True)
+    elif env.is_main:
+        print("[eval] folding disabled (fold_n=0); pLDDT will not be reported", flush=True)
+
+    # --- baselines from natural sequences (before the first checkpoint lands) ---
+    # Natural = best case, shuffled = composition-matched worst case. Both metrics get both
+    # references, so every later number has a scale to be read against.
     tok = ProteinTokenizer(mcfg)
     sp_rows = load_swissprot(SWISSPROT_CSV, tok) if os.path.exists(SWISSPROT_CSV) else []
     if sp_rows:
-        bl = lcr_baselines(sp_rows, mcfg, ev_n, ev_canvas, env, dev)
-        if bl is not None and env.is_main:
-            nat_frac, shuf_frac, n_bl = bl
-            print(f"[eval] LCR baselines ({n_bl} SwissProt seqs): "
-                  f"natural {nat_frac:.1%}, shuffled {shuf_frac:.1%}", flush=True)
+        bl = natural_baselines(sp_rows, mcfg, max(ev_n, fold_n), ev_canvas, env, dev)
         del sp_rows
+        if bl is not None:
+            nat_frac, shuf_frac, n_bl, nat_canvas, shuf_canvas = bl
+            if env.is_main:
+                print(f"[eval] LCR baselines ({n_bl} SwissProt seqs): "
+                      f"natural {nat_frac:.1%}, shuffled {shuf_frac:.1%}", flush=True)
+            if scorer is not None:
+                for label, cv in (("natural", nat_canvas), ("shuffled", shuf_canvas)):
+                    seqs, n_skip = _decode_seqs(cv[:fold_n], mcfg, ocfg.fold_min_len)
+                    m = fold_stats(seqs, scorer, env, dev, ocfg, n_skip)
+                    if env.is_main:
+                        print(f"[eval] fold baseline {label:>8} | {_fold_line(m, ocfg)}", flush=True)
     elif env.is_main:
-        print(f"[eval] WARNING: {SWISSPROT_CSV} not found, skipping LCR baselines", flush=True)
+        print(f"[eval] WARNING: {SWISSPROT_CSV} not found, skipping baselines", flush=True)
 
     while True:
         ckpt_path = _find_latest_ckpt(ckpt_dir)
@@ -260,7 +395,7 @@ def main():
 
         t0 = time.perf_counter()
         with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
-            mean, sd, n_no_eos, n_total, lcr_frac = run_eval(
+            mean, sd, n_no_eos, n_total, lcr_frac, gen = run_eval(
                 model, dev, ev_n, ev_canvas, ev_steps, env, mcfg)
         _device_sync(dev)
         dt = time.perf_counter() - t0
@@ -268,6 +403,15 @@ def main():
         if env.is_main:
             print(f"[eval] step {ck_step} | len mean {mean:.1f} sd {sd:.1f} | "
                   f"no-EOS {n_no_eos}/{n_total} | LCR {lcr_frac:.1%} | {dt:.1f}s", flush=True)
+
+        # Fold OUTSIDE the bf16 autocast: the scorer manages its own dtypes (and on XPU patches
+        # F.linear to match weights), so an enclosing autocast would fight it.
+        if scorer is not None:
+            seqs, n_skip = _decode_seqs(gen[:fold_n], mcfg, ocfg.fold_min_len)
+            m = fold_stats(seqs, scorer, env, dev, ocfg, n_skip)
+            if env.is_main:
+                print(f"[eval] step {ck_step} | {_fold_line(m, ocfg)}", flush=True)
+        del gen
 
         evaluated.add(step)
         time.sleep(args.poll)

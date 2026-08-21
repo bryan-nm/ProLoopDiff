@@ -32,6 +32,12 @@ TEXT_ENCODER = os.environ.get("PROTGEN_TEXT_ENCODER", f"{MODELS_DIR}/BioLinkBERT
 BLOSUM_MAT = os.environ.get("PROTGEN_BLOSUM", f"{MODELS_DIR}/blosum62-special-MSA.mat")
 TEXT_CACHE = os.environ.get("PROTGEN_TEXT_CACHE", f"{DATASETS_DIR}/swissprot_text_cache")    # precomputed BERT tokens
 CKPT_DIR = os.environ.get("PROTGEN_CKPT_DIR", f"{RUNS_DIR}/checkpoints")
+# ESMFold2-Fast weights for the structural eval (pLDDT). NOT under MODELS_DIR: this is the path
+# the EsmFold repo's speed_test.pbs uses and where the weights are already staged. The ESM-C 6B
+# backbone named in its config is resolved from the HuggingFace cache -- pre-cache it from a login
+# node and set HF_HUB_OFFLINE=1 on compute nodes. See the EsmFold repo's README.
+ESMFOLD_WEIGHTS = os.environ.get("PROTGEN_ESMFOLD_WEIGHTS",
+                                 "/flare/NLDesignProtein/bryan/models/ESMFold2-Fast")
 
 
 @dataclass
@@ -87,6 +93,24 @@ class OptCfg:
     eval_n: int = 100                    # sequences per eval
     eval_canvas: int = 512               # largest training bucket = the model's widest length prior
     eval_steps: int = 64                 # confidence-ordered decoding steps
+    # --- structural eval (ESMFold2-Fast pLDDT), run by the dedicated eval node ---
+    # Folding is the expensive metric: ~1.1 s/sequence on one PVC tile at fold_steps=20, and
+    # sequences are scored one at a time (no intra-batch parallelism). fold_n is PER RANK and every
+    # rank folds concurrently on its own tile, so 100/rank is ~110s wall-clock and yields
+    # 100*world sequences of statistics. 0 disables folding.
+    fold_n: int = 100                    # sequences folded per rank per eval round
+    fold_min_len: int = 10               # skip shorter generations; too short to fold meaningfully
+    # DO NOT lower fold_steps below 20: pLDDT does not degrade gracefully, it collapses to the
+    # ~0.25 no-information floor between 10 and 20 steps, which would silently look like a metric.
+    fold_steps: int = 20                 # ESMFold2 diffusion sampling steps
+    fold_loops: int = 1                  # trunk recycling; measured to not move pLDDT at all
+    plddt_confident: float = 0.70        # "confident fold" threshold (0-1 scale; = 70 on AF's 0-100)
+    # pTM is global (is the OVERALL topology right) where pLDDT is local (is each residue placed
+    # confidently). They come apart: a chain of well-formed helices floating in the wrong
+    # arrangement scores high pLDDT and low pTM, so watching only pLDDT can miss that the model
+    # makes good secondary structure and no real fold. 0.5 is the usual "topology likely correct"
+    # line. Reported on the native 0-1 scale (unlike pLDDT, pTM has no 0-100 convention).
+    ptm_confident: float = 0.50
     # bookkeeping
     log_every: int = 50
     ckpt_every: int = 1000               # ~14min at scale; crashes are common on many tiles, so save often

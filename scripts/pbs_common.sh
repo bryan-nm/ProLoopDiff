@@ -39,6 +39,17 @@ export CCL_KVS_CONNECTION_TIMEOUT=600
 export FI_PROVIDER=cxi
 export CCL_ZE_IPC_EXCHANGE=pidfd
 
+# --- ESMFold2-Fast structural eval (src/eval.py; harmless for training ranks) ---
+# The scorer lives in a sibling repo. Its deps (transformers>=4.57, esm --no-deps, biopython,
+# biotite, cloudpathlib) must already be installed into the venv above; see EsmFold/README.md.
+# HF_HUB_OFFLINE keeps the ESM-C 6B backbone resolving from ~/.cache/huggingface on compute
+# nodes, which have no network -- pre-cache it once from a login node.
+ESMFOLD_REPO=${ESMFOLD_REPO:-/flare/NLDesignProtein/bryan/Diffusion-dev-space/EsmFold}
+if [ -d "${ESMFOLD_REPO}/src" ]; then
+    export PYTHONPATH="${ESMFOLD_REPO}/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+
 MPI_LAUNCH=(mpiexec -n "${NRANKS}" -ppn "${RANKS_PER_NODE}" --pmi=pmix --cpu-bind depth -d 8)
 
 job_banner() {
