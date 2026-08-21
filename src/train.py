@@ -25,9 +25,12 @@ from .data import (ProteinTokenizer, DummyTextEmbedder, HFTextEmbedder, CacheTex
                    load_swissprot, MixedProteinDataset, BucketedLengthSampler, make_collate)
 
 try:
-    import warnings as _w
-    _w.filterwarnings("ignore", message=".*split master weight.*")
     import intel_extension_for_pytorch as ipex
+    # IPEX logs "split master weight ... only support sgd" and two BatchNorm-folding lines at INFO
+    # on every ipex.optimize call, on every rank. Its logger is named "IPEX" (see the
+    # "_logger.py - IPEX - INFO" prefix in job output) -- NOT "intel_extension_for_pytorch".
+    import logging as _logging
+    _logging.getLogger("IPEX").setLevel(_logging.WARNING)
 except Exception:
     ipex = None
 

@@ -41,9 +41,9 @@ from .data import (ProteinTokenizer, DummyTextEmbedder, HFTextEmbedder, CacheTex
                    load_swissprot, MixedProteinDataset, BucketedLengthSampler, make_collate)
 
 try:
-    import warnings as _w
-    _w.filterwarnings("ignore", message=".*split master weight.*")
     import intel_extension_for_pytorch as ipex
+    import logging as _logging
+    _logging.getLogger("IPEX").setLevel(_logging.WARNING)   # logger is named "IPEX", not the module
 except Exception:
     ipex = None
 

@@ -27,9 +27,9 @@ from .data import ProteinTokenizer, load_swissprot
 from .blosum import AA                      # canonical 20-AA alphabet, id == index
 
 try:
-    import warnings as _w
-    _w.filterwarnings("ignore", message=".*split master weight.*")
     import intel_extension_for_pytorch as ipex
+    import logging as _logging
+    _logging.getLogger("IPEX").setLevel(_logging.WARNING)   # logger is named "IPEX", not the module
 except Exception:
     ipex = None
 
@@ -280,6 +280,15 @@ def main():
     env = init_distributed(args.device)
     dev = env.device
     mcfg, ocfg = CFG.model_config(), CFG.opt
+
+    # The scorer logs model load + XPU patch details at INFO. Useful once, x12 ranks it is noise --
+    # keep rank 0 (the patch lines are worth seeing after an esm/torch upgrade) and quiet the rest.
+    # Only this logger's level is touched: calling basicConfig here would raise the ROOT level and
+    # could switch ON other libraries' INFO output instead of reducing anything. A genuine load
+    # failure is unaffected -- that is caught and printed explicitly below.
+    if not env.is_main:
+        import logging
+        logging.getLogger("esmfold_scorer").setLevel(logging.WARNING)
 
     model = RecurrentOADM(mcfg).to(dev)
     model.eval()
