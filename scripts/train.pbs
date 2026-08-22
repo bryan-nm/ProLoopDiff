@@ -9,8 +9,12 @@
 #PBS -j oe
 
 # Recurrent-OADM training + dedicated checkpoint evaluator. The last node runs src.eval (watches
-# for new checkpoints and samples from each); the remaining nodes run src.train. Both write to the
-# same PBS output stream -- [train]/[eval] prefixes distinguish them. Needs select >= 2.
+# for new checkpoints, samples from each, folds them with ESMFold); the remaining nodes run
+# src.train. Both write to the same PBS output stream -- [train]/[eval] prefixes distinguish them.
+# Needs select >= 2.
+#
+# TRAINING IS NEVER AT RISK FROM EVAL. Eval runs in the background and training in the foreground,
+# so an eval crash cannot touch the training ranks; the job's exit code is training's.
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./scripts/pbs_common.sh
 
@@ -20,10 +24,20 @@ if [ "$NNODES" -lt 2 ]; then
     exit 1
 fi
 
+# ONE rank on the eval node, deliberately, NOT the 12 that training uses per node.
+# ESMFold folding faults on Aurora when oneCCL has set up node-local Level-Zero IPC peer mappings:
+# 12-rank eval died 3 for 3, always reading an unmapped page in the 0xff03ffff... IPC range, while
+# 1-rank eval -- where dist.init_distributed returns before init_process_group and oneCCL is never
+# initialised at all -- completed cleanly. The cost is statistics, not capability: one rank folds
+# fold_n sequences per round (100 by default, ~10 min for early long generations), which fits
+# comfortably inside the ~18 min checkpoint interval. Raise ONLY with evidence that the IPC
+# interaction is resolved; the other 11 tiles idling is the price of an eval node that survives.
+EVAL_RANKS_PER_NODE=${EVAL_RANKS_PER_NODE:-1}
+
 TRAIN_NODES=$((NNODES - 1))
 EVAL_NODES=1
 TRAIN_RANKS=$((TRAIN_NODES * RANKS_PER_NODE))
-EVAL_RANKS=$((EVAL_NODES * RANKS_PER_NODE))
+EVAL_RANKS=$((EVAL_NODES * EVAL_RANKS_PER_NODE))
 
 TRAIN_NODEFILE=$(mktemp)
 EVAL_NODEFILE=$(mktemp)
@@ -34,13 +48,32 @@ TRAIN_MASTER=$(head -n1 "$TRAIN_NODEFILE")
 EVAL_MASTER=$(head -n1 "$EVAL_NODEFILE")
 
 job_banner "protein-gen training + checkpoint eval" \
-    TRAIN_NODES TRAIN_RANKS EVAL_NODES EVAL_RANKS
+    TRAIN_NODES TRAIN_RANKS EVAL_NODES EVAL_RANKS EVAL_RANKS_PER_NODE
 
-# --- eval watcher (background; killed when training finishes) ---
-MASTER_ADDR=$EVAL_MASTER MASTER_PORT=29501 \
-  mpiexec -n "$EVAL_RANKS" -ppn "$RANKS_PER_NODE" --pmi=pmix --cpu-bind depth -d 8 \
-  --hostfile "$EVAL_NODEFILE" \
-  python -m src.eval --device xpu &
+# --- eval watcher (background, supervised, killed when training finishes) ---
+# A GPU fault ABORTS the process -- it is not a Python exception, so src.eval cannot catch and
+# continue. The supervisor restarts it instead, which matters because faults are most likely EARLY:
+# an untrained model rarely emits EOS, so its generations run the full 512 canvas, and ESMFold cost
+# and memory both go as L^2. As EOS placement is learned the sequences shorten and folding gets
+# cheaper and safer, so riding out the early rounds is usually enough. Bounded, so a permanently
+# broken eval cannot spin for the whole walltime.
+(
+    attempt=0
+    while [ "$attempt" -lt "${EVAL_MAX_RESTARTS:-5}" ]; do
+        attempt=$((attempt + 1))
+        echo "[eval-supervisor] starting src.eval (attempt ${attempt}/${EVAL_MAX_RESTARTS:-5})"
+        # shellcheck disable=SC2086  # EVAL_ARGS is deliberately word-split into separate flags
+        MASTER_ADDR=$EVAL_MASTER MASTER_PORT=29501 \
+          mpiexec -n "$EVAL_RANKS" -ppn "$EVAL_RANKS_PER_NODE" --pmi=pmix --cpu-bind depth -d 8 \
+          --hostfile "$EVAL_NODEFILE" \
+          python -m src.eval --device xpu ${EVAL_ARGS:-}
+        erc=$?
+        echo "[eval-supervisor] src.eval exited rc=${erc}"
+        [ "$erc" -eq 0 ] && break            # clean exit (e.g. --once): nothing to restart
+        sleep 30
+    done
+    echo "[eval-supervisor] not restarting further"
+) &
 eval_pid=$!
 
 # --- training (foreground) ---
@@ -50,7 +83,9 @@ MASTER_ADDR=$TRAIN_MASTER MASTER_PORT=29500 \
   python -m src.train --device xpu
 rc=$?
 
-# training done; stop the eval watcher and clean up
-kill $eval_pid 2>/dev/null; wait $eval_pid 2>/dev/null
+# Training done. Kill the supervisor FIRST so it cannot start another attempt, then the mpiexec it
+# is waiting on (killing the subshell alone would orphan that child).
+kill "$eval_pid" 2>/dev/null; wait "$eval_pid" 2>/dev/null
+pkill -f "src\.eval" 2>/dev/null
 rm -f "$TRAIN_NODEFILE" "$EVAL_NODEFILE"
 echo "[job] exit $rc"; exit $rc
